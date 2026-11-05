@@ -1,0 +1,5 @@
+.venv/
+dist/
+__pycache__/
+.ruff_cache/
+plugin/local_config.py

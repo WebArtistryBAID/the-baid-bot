@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "id": "dev.dreta.grouprelay",
+  "name": "Group Relay",
+  "version": "0.1.0",
+  "author": "Dreta",
+  "description": "Forwards text messages between two WeChat group chats, with rate limits.",
+  "entry": "main",
+  "processes": ["main"]
+}
