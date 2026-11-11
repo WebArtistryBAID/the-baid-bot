@@ -95,6 +95,7 @@ def message(talker=A, sender="wxid_nick", text="hello", **overrides):
 class PluginMainTest(unittest.TestCase):
     def setUp(self):
         self.sent = []
+        self.contexts = []
         self.listeners = []
         self.database = FakeDatabase()
 
@@ -130,6 +131,8 @@ class PluginMainTest(unittest.TestCase):
         self.main = importlib.import_module(".main", NAMESPACE)
         self.main.MIN_SEND_PAUSE_SECONDS = 0
         self.main.MAX_SEND_PAUSE_SECONDS = 0
+        # Long enough for a test's messages to arrive before the first send.
+        self.main.COMBINE_WAIT_SECONDS = 0.3
 
     def send_text(self, destination, text):
         self.sent.append((destination, text))
@@ -164,6 +167,7 @@ class PluginMainTest(unittest.TestCase):
         context = FakeContext()
         self.main.setup(context)
         self.addCleanup(context.close)
+        self.contexts.append(context)
         return context, self.listeners[0]
 
     def test_forwards_both_ways_with_group_nickname_then_regular_name(self):
@@ -172,13 +176,12 @@ class PluginMainTest(unittest.TestCase):
         listener.onInsert("message", message(talker=B, sender="wxid_plain", text="two"))
         listener.onInsert("message", message(talker=B, sender="wxid_unknown", text="three"))
 
-        self.assertTrue(wait_until(lambda: len(self.sent) == 3))
+        self.assertTrue(wait_until(lambda: len(self.sent) == 2))
         self.assertEqual(
             self.sent,
             [
                 (B, "Group Nick: one"),
-                (A, "Plain Name: two"),
-                (A, "wxid_unknown: three"),
+                (A, "Plain Name: two\nwxid_unknown: three"),
             ],
         )
         self.assertNotIn(threading.current_thread(), self.database.reader_threads)
@@ -189,21 +192,52 @@ class PluginMainTest(unittest.TestCase):
         for number in range(4):
             listener.onInsert("message", message(text=str(number)))
 
-        self.assertTrue(wait_until(lambda: len(self.sent) == 2))
+        self.assertTrue(wait_until(lambda: self.sent))
         time.sleep(0.05)
-        self.assertEqual(self.sent, [(B, "Group Nick: 0"), (B, "Group Nick: 1")])
+        self.assertEqual(self.sent, [(B, "Group Nick: 0\nGroup Nick: 1")])
         drops = [line for line in context.log.lines if "user_rate_limited" in line]
         self.assertEqual(len(drops), 2)
 
-    def test_global_limit_constant_holds_back_extra_messages(self):
-        self.main.GLOBAL_MAX_MESSAGES_PER_MINUTE = 2
+    def test_global_limit_constant_holds_back_the_next_send(self):
+        self.main.GLOBAL_MAX_MESSAGES_PER_MINUTE = 1
+        _, listener = self.start()
+        for sender in ("wxid_1", "wxid_2", "wxid_3"):
+            listener.onInsert("message", message(sender=sender))
+
+        self.assertTrue(wait_until(lambda: self.sent))
+        self.assertEqual(self.sent, [(B, "wxid_1: hello\nwxid_2: hello\nwxid_3: hello")])
+
+        listener.onInsert("message", message(sender="wxid_4"))
+        time.sleep(0.6)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_combined_character_limit_constant_splits_sends(self):
+        self.main.MAX_COMBINED_CHARACTERS = len("wxid_1: hello\nwxid_2: hello")
         _, listener = self.start()
         for sender in ("wxid_1", "wxid_2", "wxid_3"):
             listener.onInsert("message", message(sender=sender))
 
         self.assertTrue(wait_until(lambda: len(self.sent) == 2))
-        time.sleep(0.05)
-        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(
+            self.sent,
+            [(B, "wxid_1: hello\nwxid_2: hello"), (B, "wxid_3: hello")],
+        )
+
+    def test_failed_name_lookup_falls_back_to_the_wechat_id(self):
+        self.database.getGroupMemberDisplayName = mock.Mock(side_effect=RuntimeError("db"))
+        _, listener = self.start()
+        listener.onInsert("message", message(sender="wxid_nick"))
+
+        self.assertTrue(wait_until(lambda: self.sent))
+        self.assertEqual(self.sent, [(B, "wxid_nick: hello")])
+
+    def test_failed_send_is_logged(self):
+        _, listener = self.start()
+        self.main.WeMessageApi.INSTANCE.sendText = lambda destination, text: False
+        context = self.contexts[-1]
+        listener.onInsert("message", message())
+
+        self.assertTrue(wait_until(lambda: f"Could not send to {B}" in context.log.lines))
 
     def test_without_groups_it_logs_group_ids_and_sends_nothing(self):
         context, listener = self.start(group_a="", group_b="")

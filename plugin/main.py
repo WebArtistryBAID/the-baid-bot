@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import queue
 import random
 import threading
 
@@ -20,6 +19,7 @@ from .relay_core import (
     Forward,
     Intake,
     MessageRow,
+    Outbox,
     RateLimiter,
     run_sender,
 )
@@ -41,15 +41,25 @@ except ModuleNotFoundError:
     GROUP_B = ""
 
 # The most messages the bot may send per minute, across both groups. Messages over
-# this limit wait in the queue.
+# this limit wait in the queue. Because waiting messages are combined, one send can
+# carry many people's messages.
 GLOBAL_MAX_MESSAGES_PER_MINUTE = 5 # 20
 
 # The most messages forwarded per minute for one person, across both groups. Messages
 # over this limit are dropped.
-PER_USER_MAX_MESSAGES_PER_MINUTE = 5
+PER_USER_MAX_MESSAGES_PER_MINUTE = 12
 
-# The most messages that can wait to be sent. New messages are dropped once it is full.
-MAX_QUEUED_MESSAGES = 5 # 50
+# The most messages that can wait to be sent, counting each original message. New
+# messages are dropped once it is full.
+MAX_QUEUED_MESSAGES = 100 
+
+# Messages waiting for the same group are sent together as one message, one line each.
+# After a message arrives, wait this long for others to join it before sending.
+COMBINE_WAIT_SECONDS = 5
+
+# The longest a combined message can be, in characters. Messages that don't fit wait
+# for the next send. A single message longer than this is still sent on its own.
+MAX_COMBINED_CHARACTERS = 1000
 
 # Skip messages older than this, such as a backlog that arrives after a reconnect.
 MAX_MESSAGE_AGE_SECONDS = 300
@@ -58,7 +68,8 @@ MAX_MESSAGE_AGE_SECONDS = 300
 MIN_SEND_PAUSE_SECONDS = 1.0
 MAX_SEND_PAUSE_SECONDS = 2.5
 
-# How each forwarded message appears. Available fields: {name} and {text}.
+# How each forwarded message appears, as one line of a combined message. Available
+# fields: {name} and {text}.
 FORWARD_FORMAT = "{name}: {text}"
 
 # -----------------------------------------------------------------------
@@ -66,19 +77,25 @@ FORWARD_FORMAT = "{name}: {text}"
 
 def _member_name(group: str, wxid: str) -> str:
     database = WeDatabaseApi.INSTANCE
-    return (
-        database.getGroupMemberDisplayName(group, wxid)
-        or database.getDisplayName(wxid)
-        or wxid
-    )
+    try:
+        return (
+            database.getGroupMemberDisplayName(group, wxid)
+            or database.getDisplayName(wxid)
+            or wxid
+        )
+    except Exception:  # noqa: BLE001 - a failed lookup shouldn't cost the message
+        return wxid
 
 
-def _deliver(ctx, forward: Forward) -> None:
+def _format_line(forward: Forward) -> str:
     # This runs on the sender thread, so database reads never block WeChat's insert.
     name = _member_name(forward.source_group, forward.sender)
-    message = FORWARD_FORMAT.format(name=name, text=forward.text)
-    if not WeMessageApi.INSTANCE.sendText(forward.destination_group, message):
-        ctx.log.error(f"Could not send to {forward.destination_group}")
+    return FORWARD_FORMAT.format(name=name, text=forward.text)
+
+
+def _deliver(ctx, destination: str, text: str) -> None:
+    if not WeMessageApi.INSTANCE.sendText(destination, text):
+        ctx.log.error(f"Could not send to {destination}")
 
 
 def _log_discovered_group(ctx, group: str) -> None:
@@ -97,7 +114,7 @@ def setup(ctx) -> None:
         ctx.log.warning("GROUP_A and GROUP_B are not set up; logging group IDs only")
 
     stop = threading.Event()
-    outbox: queue.Queue[Forward] = queue.Queue(maxsize=MAX_QUEUED_MESSAGES)
+    outbox = Outbox(MAX_QUEUED_MESSAGES)
     global_limiter = RateLimiter(GLOBAL_MAX_MESSAGES_PER_MINUTE)
     intake = Intake(
         routes,
@@ -145,8 +162,11 @@ def setup(ctx) -> None:
         args=(
             outbox,
             global_limiter,
-            lambda forward: _deliver(ctx, forward),
+            _format_line,
+            lambda destination, text: _deliver(ctx, destination, text),
             stop,
+            COMBINE_WAIT_SECONDS,
+            MAX_COMBINED_CHARACTERS,
             lambda: random.uniform(MIN_SEND_PAUSE_SECONDS, MAX_SEND_PAUSE_SECONDS),
             lambda error: ctx.log.exception(message="Could not forward a message", error=error),
         ),

@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import queue
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Hashable, Mapping
+from collections.abc import Callable, Hashable, Iterable, Mapping
 from dataclasses import dataclass
 
 TEXT_MESSAGE_TYPE = 1
@@ -92,6 +91,46 @@ def parse_group_content(content: str | None) -> tuple[str, str] | None:
     return sender, text
 
 
+class Outbox:
+    """Messages waiting to be sent, in arrival order, across both destination groups."""
+
+    def __init__(self, max_messages: int) -> None:
+        self._max_messages = max_messages
+        self._forwards: deque[Forward] = deque()
+        self._condition = threading.Condition()
+
+    def __len__(self) -> int:
+        with self._condition:
+            return len(self._forwards)
+
+    def put(self, forward: Forward) -> bool:
+        """Adds a message, returning False if the outbox is full."""
+        with self._condition:
+            if len(self._forwards) >= self._max_messages:
+                return False
+            self._forwards.append(forward)
+            self._condition.notify()
+            return True
+
+    def next_destination(self, timeout: float) -> str | None:
+        """Waits for a message, then returns the group the oldest message is going to."""
+        with self._condition:
+            if not self._forwards:
+                self._condition.wait(timeout)
+            return self._forwards[0].destination_group if self._forwards else None
+
+    def waiting_for(self, destination: str) -> list[Forward]:
+        """Returns the messages going to one group, oldest first, without removing them."""
+        with self._condition:
+            return [f for f in self._forwards if f.destination_group == destination]
+
+    def remove(self, forwards: Iterable[Forward]) -> None:
+        # Compare by identity, because two people can send identical messages.
+        removed = {id(forward) for forward in forwards}
+        with self._condition:
+            self._forwards = deque(f for f in self._forwards if id(f) not in removed)
+
+
 class Intake:
     """Decides whether a new message row should be queued for forwarding."""
 
@@ -99,7 +138,7 @@ class Intake:
         self,
         routes: Mapping[str, str],
         user_limiter: RateLimiter,
-        outbox: queue.Queue[Forward],
+        outbox: Outbox,
         max_age_seconds: float,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
@@ -134,34 +173,74 @@ class Intake:
         if not self._user_limiter.try_acquire(sender):
             return USER_RATE_LIMITED
 
-        try:
-            self._outbox.put_nowait(Forward(row.talker, destination, sender, text))
-        except queue.Full:
+        if not self._outbox.put(Forward(row.talker, destination, sender, text)):
             return QUEUE_FULL
         return QUEUED
 
 
+def combine(
+    forwards: Iterable[Forward],
+    format_line: Callable[[Forward], str],
+    max_characters: int,
+    on_error: Callable[[Exception], object],
+) -> tuple[str, list[Forward]]:
+    """Joins messages into one, one line each, stopping before it gets too long.
+
+    Returns the combined text and the messages it used up. The first message is always
+    used, even if it is longer than the limit. A message that can't be formatted is
+    reported and used up, so it can't block the ones behind it.
+    """
+    lines: list[str] = []
+    used: list[Forward] = []
+    length = 0
+    for forward in forwards:
+        try:
+            line = format_line(forward)
+        except Exception as error:  # noqa: BLE001 - one bad message must not stop the rest
+            on_error(error)
+            used.append(forward)
+            continue
+        added = len(line) + (1 if lines else 0)
+        if lines and length + added > max_characters:
+            break
+        lines.append(line)
+        used.append(forward)
+        length += added
+    return "\n".join(lines), used
+
+
 def run_sender(
-    outbox: queue.Queue[Forward],
+    outbox: Outbox,
     global_limiter: RateLimiter,
-    deliver: Callable[[Forward], object],
+    format_line: Callable[[Forward], str],
+    deliver: Callable[[str, str], object],
     stop: threading.Event,
+    collect_seconds: float,
+    max_characters: int,
     pause_seconds: Callable[[], float],
     on_error: Callable[[Exception], object],
 ) -> None:
-    """Sends queued forwards in order, waiting whenever the global limit is reached."""
+    """Sends waiting messages, combining those going to the same group into one send.
+
+    After the first message arrives, it waits `collect_seconds` so more can join it.
+    While the global limit holds a send back, new messages keep joining it too.
+    """
     while not stop.is_set():
-        try:
-            forward = outbox.get(timeout=0.5)
-        except queue.Empty:
+        destination = outbox.next_destination(timeout=0.5)
+        if destination is None:
             continue
+        if stop.wait(collect_seconds):
+            return
 
         while not global_limiter.try_acquire():
             if stop.wait(global_limiter.seconds_until_available()):
                 return
 
-        try:
-            deliver(forward)
-        except Exception as error:  # noqa: BLE001 - one failed send must not stop the relay
-            on_error(error)
+        text, used = combine(outbox.waiting_for(destination), format_line, max_characters, on_error)
+        outbox.remove(used)
+        if text:
+            try:
+                deliver(destination, text)
+            except Exception as error:  # noqa: BLE001 - one failed send must not stop the relay
+                on_error(error)
         stop.wait(pause_seconds())
