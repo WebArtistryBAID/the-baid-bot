@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "dev.dreta.grouprelay",
   "name": "Group Relay",
-  "version": "0.8.0",
+  "version": "0.11.1",
   "author": "Dreta",
   "description": "Forwards text and image messages between two WeChat group chats, with rate limits.",
   "entry": "main",

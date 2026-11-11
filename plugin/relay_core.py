@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import random
+import re
 import threading
 import time
 import unicodedata
 from collections import deque
-from collections.abc import Callable, Hashable, Iterable, Mapping
+from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,9 +22,22 @@ DUPLICATE = "duplicate"
 STALE = "stale"
 BAD_IMAGE = "bad_image"
 BLOCKED = "blocked"
+ANNOUNCEMENT = "announcement"
 IMAGE_RATE_LIMITED = "image_rate_limited"
 USER_RATE_LIMITED = "user_rate_limited"
 QUEUE_FULL = "queue_full"
+
+
+class SilentLog:
+    """Accepts log messages and discards them, for when no logger is given."""
+
+    def debug(self, message: object) -> None: ...
+    def info(self, message: object) -> None: ...
+    def warning(self, message: object) -> None: ...
+
+
+def _plural(count: int, word: str) -> str:
+    return f"{count} {word}" if count == 1 else f"{count} {word}s"
 
 
 class RateLimiter:
@@ -41,6 +56,16 @@ class RateLimiter:
         self._clock = clock
         self._lock = threading.Lock()
         self._events: dict[Hashable, deque[float]] = {}
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    def describe(self) -> str:
+        """The limit in words, such as "5 per minute"."""
+        if self._window == 60:
+            return f"{self._limit} per minute"
+        return f"{self._limit} per {self._window:g} seconds"
 
     def _prune(self, now: float) -> None:
         for key, events in list(self._events.items()):
@@ -79,6 +104,9 @@ class MessageRow:
     content: str | None
     server_id: int | None
     create_time_ms: int | None
+    # The message's hidden metadata (WeChat's `lvbuffer` column), which lists who it
+    # mentions. None when WeChat didn't provide it.
+    msg_source: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -90,10 +118,38 @@ class Forward:
     sender: str
     text: str
     image_server_id: int | None = None
+    # A reply from the bot itself, sent as its own message rather than forwarded. For a
+    # reply, `text` is the whole message and both groups are the group it goes to.
+    is_reply: bool = False
 
     @property
     def is_image(self) -> bool:
         return self.image_server_id is not None
+
+
+_AT_USER_LIST = re.compile(
+    rb"<atuserlist>\s*(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?\s*</atuserlist>", re.DOTALL
+)
+
+
+def mentioned_users(msg_source: bytes | None) -> set[str]:
+    """The WeChat IDs a message mentions, read from its hidden metadata."""
+    if not msg_source:
+        return set()
+    found = _AT_USER_LIST.search(msg_source)
+    if found is None:
+        return set()
+    ids = found.group(1).decode("utf-8", errors="ignore").split(",")
+    return {wxid.strip() for wxid in ids if wxid.strip()}
+
+
+def is_announcement(msg_source: bytes | None) -> bool:
+    """Whether a message is a group announcement (群公告).
+
+    WeChat marks an announcement by listing "announcement@all" among the users it
+    mentions. A plain @所有人 message lists "notify@all" instead, so it isn't matched.
+    """
+    return msg_source is not None and b"announcement@all" in msg_source
 
 
 def parse_group_content(content: str | None) -> tuple[str, str] | None:
@@ -115,6 +171,10 @@ class Outbox:
     def __len__(self) -> int:
         with self._condition:
             return len(self._forwards)
+
+    @property
+    def max_messages(self) -> int:
+        return self._max_messages
 
     def put(self, forward: Forward) -> bool:
         """Adds a message, returning False if the outbox is full."""
@@ -223,6 +283,49 @@ def load_blocked_words(path: Path) -> BlockedWords | None:
     return BlockedWords(text.splitlines())
 
 
+class MentionReply:
+    """Decides the bot's reply when someone @mentions it.
+
+    The reply is `reply_format` with {person} filled in by a random entry from `people`.
+    Each sender gets at most one reply per `cooldown_seconds`, so mentions can't be used
+    to make the bot spam the group.
+    """
+
+    COOLING_DOWN = object()
+
+    def __init__(
+        self,
+        own_id: Callable[[], str | None],
+        reply_format: str,
+        people: Sequence[str],
+        cooldown_seconds: float,
+        choose: Callable[[Sequence[str]], str] = random.choice,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if isinstance(people, str):
+            people = [people]
+        self._people = [person.strip() for person in people if person.strip()]
+        if not self._people:
+            raise ValueError("a mention reply needs at least one name")
+        self._own_id = own_id
+        self._reply_format = reply_format
+        self._choose = choose
+        self._cooldown = RateLimiter(1, window_seconds=cooldown_seconds, clock=clock)
+
+    @property
+    def people_count(self) -> int:
+        return len(self._people)
+
+    def reply_to(self, sender: str, msg_source: bytes | None):
+        """The reply text, COOLING_DOWN, or None if the message doesn't mention the bot."""
+        own_id = self._own_id()
+        if not own_id or own_id not in mentioned_users(msg_source):
+            return None
+        if not self._cooldown.try_acquire(sender):
+            return MentionReply.COOLING_DOWN
+        return self._reply_format.format(person=self._choose(self._people))
+
+
 class Intake:
     """Decides whether a new message row should be queued for forwarding."""
 
@@ -235,10 +338,18 @@ class Intake:
         *,
         image_limiter: RateLimiter | None = None,
         blocked_words: BlockedWords | None = None,
+        mention_reply: MentionReply | None = None,
+        log: object | None = None,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
-        """Images are forwarded only when `image_limiter` is given."""
+        """Images are forwarded only when `image_limiter` is given.
+
+        `log` receives a line for each decision about a message from one of the two
+        groups. Lines name the sender's WeChat ID and the group, never the message text.
+        """
         self._routes = routes
+        self._mention_reply = mention_reply
+        self._log = log or SilentLog()
         self._blocked_words = blocked_words or BlockedWords([])
         self._user_limiter = user_limiter
         self._image_limiter = image_limiter
@@ -260,32 +371,56 @@ class Intake:
         if parsed is None:
             return IGNORED
         sender, text = parsed
-
+        group = row.talker
         is_image = row.msg_type == IMAGE_MESSAGE_TYPE
+        kind = "image" if is_image else "message"
+        a_kind = "an image" if is_image else "a message"
+        source = f"from {sender} in {group}"
+
+        # Checked before the rate limits, so an announcement doesn't use up any quota.
+        if is_announcement(row.msg_source):
+            self._log.info(f"Skipped a group announcement {source}")
+            return ANNOUNCEMENT
+
         if is_image:
             # The server ID is how the sender later asks WeKit for the image.
             if not row.server_id:
+                self._log.warning(f"Skipped an image {source}: it has no server ID")
                 return BAD_IMAGE
             text = ""
         # Checked before the rate limits, so a blocked message doesn't use up any quota.
         elif self._blocked_words.matches(text):
+            self._log.info(f"Blocked a message {source}: it contains a blocked word")
             return BLOCKED
 
         if row.server_id:
             if row.server_id in self._seen_ids:
+                self._log.debug(f"Skipped a repeat of {kind} {row.server_id} {source}")
                 return DUPLICATE
             self._seen_ids.append(row.server_id)
 
         if row.create_time_ms is not None:
             age_seconds = self._wall_clock() - row.create_time_ms / 1000
             if age_seconds > self._max_age_seconds:
+                self._log.warning(
+                    f"Skipped an old {kind} {source}: sent {age_seconds:.0f}s ago, "
+                    f"over the {self._max_age_seconds:g}s limit"
+                )
                 return STALE
 
         # Check the image limit first without using it, so a refused image doesn't use up
         # the sender's general quota.
         if is_image and self._image_limiter.seconds_until_available(sender) > 0:
+            self._log.warning(
+                f"Image limit reached for {sender} ({self._image_limiter.describe()}); "
+                f"dropped their image in {group}"
+            )
             return IMAGE_RATE_LIMITED
         if not self._user_limiter.try_acquire(sender):
+            self._log.warning(
+                f"Message limit reached for {sender} ({self._user_limiter.describe()}); "
+                f"dropped their {kind} in {group}"
+            )
             return USER_RATE_LIMITED
         if is_image:
             self._image_limiter.try_acquire(sender)
@@ -298,8 +433,28 @@ class Intake:
             image_server_id=row.server_id if is_image else None,
         )
         if not self._outbox.put(forward):
+            self._log.warning(
+                f"Queue full ({self._outbox.max_messages} waiting); dropped {a_kind} {source}"
+            )
             return QUEUE_FULL
+        self._log.info(
+            f"Queued {a_kind} {source} for {destination} ({len(self._outbox)} waiting)"
+        )
+        if self._mention_reply is not None:
+            self._queue_mention_reply(row, sender, group)
         return QUEUED
+
+    def _queue_mention_reply(self, row: MessageRow, sender: str, group: str) -> None:
+        reply = self._mention_reply.reply_to(sender, row.msg_source)
+        if reply is None:
+            return
+        if reply == MentionReply.COOLING_DOWN:
+            self._log.info(f"Not replying to a mention from {sender} in {group}: on cooldown")
+            return
+        if not self._outbox.put(Forward(group, group, sender, reply, is_reply=True)):
+            self._log.warning(f"Queue full; not replying to a mention from {sender} in {group}")
+            return
+        self._log.info(f"Queued a mention reply to {sender} in {group}")
 
 
 def combine(
@@ -323,6 +478,11 @@ def combine(
     used: list[Forward] = []
     length = 0
     for forward in forwards:
+        # A reply is a message of its own, so it never shares a send with forwards.
+        if forward.is_reply:
+            if lines:
+                break
+            return forward.text, [*used, forward], None, None
         try:
             line = format_line(forward)
         except Exception as error:  # noqa: BLE001 - one bad message must not stop the rest
@@ -340,12 +500,25 @@ def combine(
     return "\n".join(lines), used, None, None
 
 
-def _acquire(limiter: RateLimiter, stop: threading.Event) -> bool:
-    """Waits for the limiter, returning False if the relay stopped first."""
+def _acquire(
+    limiter: RateLimiter,
+    stop: threading.Event,
+    on_wait: Callable[[float], object] = lambda seconds: None,
+) -> tuple[bool, bool]:
+    """Waits for the limiter.
+
+    Returns whether to go ahead (False if the relay stopped first), and whether it had
+    to wait. `on_wait` is called once, with the expected wait, when waiting starts.
+    """
+    waited = False
     while not limiter.try_acquire():
-        if stop.wait(limiter.seconds_until_available()):
-            return False
-    return True
+        seconds = limiter.seconds_until_available()
+        if not waited:
+            on_wait(seconds)
+            waited = True
+        if stop.wait(seconds):
+            return False, waited
+    return True, waited
 
 
 def run_sender(
@@ -360,6 +533,7 @@ def run_sender(
     max_characters: int,
     pause_seconds: Callable[[], float],
     on_error: Callable[[Exception], object],
+    log: object | None = None,
 ) -> None:
     """Sends waiting messages, combining those going to the same group into one send.
 
@@ -371,14 +545,25 @@ def run_sender(
     added to the text. A failed image is dropped along with its credit line. The image
     itself is its own send, made straight after the text, and it counts toward the
     global limit like any other send.
+
+    `log` receives a line when the global limit holds sends back, and for each send.
     """
+    log = log or SilentLog()
+
+    def on_wait(seconds: float) -> None:
+        log.warning(
+            f"Global limit reached ({_plural(global_limiter.limit, 'send')} per minute); waiting "
+            f"{seconds:.0f}s with {_plural(len(outbox), 'message')} queued"
+        )
+
     while not stop.is_set():
         destination = outbox.next_destination(timeout=0.5)
         if destination is None:
             continue
         if stop.wait(collect_seconds):
             return
-        if not _acquire(global_limiter, stop):
+        go, waited = _acquire(global_limiter, stop, on_wait)
+        if not go:
             return
 
         text, used, image, credit = combine(
@@ -402,9 +587,23 @@ def run_sender(
                 deliver(destination, text)
             except Exception as error:  # noqa: BLE001 - one failed send must not stop the relay
                 on_error(error)
+            else:
+                count = sum(1 for f in used if not f.is_image and not f.is_reply)
+                parts = [_plural(count, "message")] if count else []
+                if any(f.is_reply for f in used):
+                    parts.append("a mention reply")
+                if image is not None:
+                    parts.append("an image credit")
+                after_wait = " after waiting for the global limit" if waited else ""
+                log.info(
+                    f"Sent {' and '.join(parts)} to {destination} in one send "
+                    f"({len(text)} characters){after_wait}; "
+                    f"{_plural(len(outbox), 'message')} still queued"
+                )
         if image is not None:
             stop.wait(pause_seconds())
-            if not _acquire(global_limiter, stop):
+            go, _ = _acquire(global_limiter, stop, on_wait)
+            if not go:
                 return
             try:
                 deliver_image(destination, image, prepared)

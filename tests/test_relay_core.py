@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "plugin"))
 
 from relay_core import (
+    ANNOUNCEMENT,
     BAD_IMAGE,
     BLOCKED,
     DUPLICATE,
@@ -21,11 +22,14 @@ from relay_core import (
     BlockedWords,
     Forward,
     Intake,
+    MentionReply,
     MessageRow,
     Outbox,
     RateLimiter,
     combine,
+    is_announcement,
     load_blocked_words,
+    mentioned_users,
     normalise_for_matching,
     parse_group_content,
     run_sender,
@@ -68,7 +72,24 @@ def image_row(sender="wxid_x", server_id=500, content=None, **overrides):
     )
 
 
-def make_intake(user_limit=100, max_queue=100, image_limit=None, blocked=()):
+class RecordingLog:
+    def __init__(self):
+        self.lines = []
+
+    def debug(self, message):
+        self.lines.append(("debug", message))
+
+    def info(self, message):
+        self.lines.append(("info", message))
+
+    def warning(self, message):
+        self.lines.append(("warning", message))
+
+    def messages(self):
+        return [message for _, message in self.lines]
+
+
+def make_intake(user_limit=100, max_queue=100, image_limit=None, blocked=(), log=None):
     outbox = Outbox(max_queue)
     clock = FakeClock()
     limiter = RateLimiter(user_limit, clock=clock)
@@ -80,6 +101,7 @@ def make_intake(user_limit=100, max_queue=100, image_limit=None, blocked=()):
         300,
         image_limiter=image_limiter,
         blocked_words=BlockedWords(blocked),
+        log=log,
         wall_clock=lambda: NOW,
     )
     return intake, outbox, clock
@@ -236,6 +258,168 @@ class LoadBlockedWordsTest(unittest.TestCase):
             load_blocked_words(self.path)
 
 
+class AnnouncementTest(unittest.TestCase):
+    def test_recognises_announcements_only(self):
+        self.assertTrue(is_announcement(b"<atuserlist>announcement@all</atuserlist>"))
+        self.assertTrue(is_announcement(b"<atuserlist>wxid_a,announcement@all</atuserlist>"))
+        self.assertFalse(is_announcement(b"<atuserlist>notify@all</atuserlist>"))
+        self.assertFalse(is_announcement(b""))
+        self.assertFalse(is_announcement(None))
+
+    def test_announcement_is_not_queued_and_uses_no_quota(self):
+        intake, outbox, _ = make_intake(user_limit=1)
+        source = b"<msgsource><atuserlist>announcement@all</atuserlist></msgsource>"
+        self.assertEqual(intake.accept(row(msg_source=source)), ANNOUNCEMENT)
+        self.assertEqual(len(outbox), 0)
+        self.assertEqual(intake.accept(row()), QUEUED)
+
+    def test_announcements_are_dropped_in_both_directions(self):
+        intake, _, _ = make_intake()
+        source = b"announcement@all"
+        self.assertEqual(intake.accept(row(talker=B, msg_source=source)), ANNOUNCEMENT)
+
+
+class IntakeLogTest(unittest.TestCase):
+    def accept(self, row_to_accept, **intake_options):
+        log = RecordingLog()
+        intake, _outbox, clock = make_intake(log=log, **intake_options)
+        return intake, log, clock
+
+    def test_queued_message_names_sender_groups_and_queue_length(self):
+        intake, log, _ = self.accept(None)
+        intake.accept(row())
+        intake.accept(row(content="wxid_y:\nhi"))
+        self.assertEqual(
+            log.lines,
+            [
+                ("info", f"Queued a message from wxid_x in {A} for {B} (1 waiting)"),
+                ("info", f"Queued a message from wxid_y in {A} for {B} (2 waiting)"),
+            ],
+        )
+
+    def test_each_reason_for_not_forwarding_is_explained(self):
+        log = RecordingLog()
+        intake, _, _ = make_intake(user_limit=1, max_queue=2, image_limit=1, blocked=["spam"], log=log)
+        source = b"announcement@all"
+        cases = [
+            (row(msg_source=source), "info", f"Skipped a group announcement from wxid_x in {A}"),
+            (row(content="wxid_x:\nspam"), "info",
+             f"Blocked a message from wxid_x in {A}: it contains a blocked word"),
+            (image_row(server_id=None), "warning", f"Skipped an image from wxid_x in {A}: it has no server ID"),
+            (row(create_time_ms=int((NOW - 400) * 1000)), "warning",
+             f"Skipped an old message from wxid_x in {A}: sent 400s ago, over the 300s limit"),
+            (row(server_id=9), "info", f"Queued a message from wxid_x in {A} for {B} (1 waiting)"),
+            (row(server_id=9), "debug", f"Skipped a repeat of message 9 from wxid_x in {A}"),
+            (row(server_id=10), "warning",
+             f"Message limit reached for wxid_x (1 per minute); dropped their message in {A}"),
+            (image_row(sender="wxid_y", server_id=11), "info",
+             f"Queued an image from wxid_y in {A} for {B} (2 waiting)"),
+            (image_row(sender="wxid_y", server_id=12), "warning",
+             f"Image limit reached for wxid_y (1 per minute); dropped their image in {A}"),
+            (row(content="wxid_z:\nhello", server_id=13), "warning",
+             f"Queue full (2 waiting); dropped a message from wxid_z in {A}"),
+        ]
+        for message_row, level, expected in cases:
+            with self.subTest(expected):
+                intake.accept(message_row)
+                self.assertEqual(log.lines[-1], (level, expected))
+
+    def test_ignored_rows_are_not_logged(self):
+        log = RecordingLog()
+        intake, _, _ = make_intake(log=log)
+        intake.accept(row(talker="c@chatroom"))
+        intake.accept(row(is_send=1))
+        self.assertEqual(log.lines, [])
+
+
+MENTIONS_BOT = b"<msgsource><atuserlist><![CDATA[,wxid_a, wxid_bot]]></atuserlist></msgsource>"
+
+
+def mention_reply(people=("甲", "乙"), cooldown=60, clock=None, own_id="wxid_bot"):
+    return MentionReply(
+        lambda: own_id,
+        "喵喵喵，我猜你是{person}",
+        list(people),
+        cooldown,
+        choose=lambda names: names[-1],
+        clock=clock or FakeClock(),
+    )
+
+
+class MentionedUsersTest(unittest.TestCase):
+    def test_reads_plain_and_cdata_lists(self):
+        self.assertEqual(mentioned_users(b"<atuserlist>wxid_a,wxid_b</atuserlist>"), {"wxid_a", "wxid_b"})
+        self.assertEqual(mentioned_users(MENTIONS_BOT), {"wxid_a", "wxid_bot"})
+
+    def test_handles_missing_or_empty_lists(self):
+        for source in (None, b"", b"<msgsource></msgsource>", b"<atuserlist></atuserlist>"):
+            with self.subTest(source):
+                self.assertEqual(mentioned_users(source), set())
+
+
+class MentionReplyTest(unittest.TestCase):
+    def test_replies_only_when_the_bot_is_mentioned(self):
+        reply = mention_reply()
+        self.assertEqual(reply.reply_to("wxid_x", MENTIONS_BOT), "喵喵喵，我猜你是乙")
+        self.assertIsNone(reply.reply_to("wxid_y", b"<atuserlist>wxid_a</atuserlist>"))
+        self.assertIsNone(reply.reply_to("wxid_y", None))
+
+    def test_no_reply_when_the_bot_id_is_unknown(self):
+        self.assertIsNone(mention_reply(own_id=None).reply_to("wxid_x", MENTIONS_BOT))
+
+    def test_cooldown_is_per_person(self):
+        clock = FakeClock()
+        reply = mention_reply(clock=clock)
+        self.assertIsInstance(reply.reply_to("wxid_x", MENTIONS_BOT), str)
+        self.assertIs(reply.reply_to("wxid_x", MENTIONS_BOT), MentionReply.COOLING_DOWN)
+        self.assertIsInstance(reply.reply_to("wxid_y", MENTIONS_BOT), str)
+        clock.now = 60
+        self.assertIsInstance(reply.reply_to("wxid_x", MENTIONS_BOT), str)
+
+    def test_picks_from_the_people_given(self):
+        reply = MentionReply(lambda: "wxid_bot", "{person}", ["甲", "乙", "丙"], 0.0)
+        seen = {reply.reply_to(f"wxid_{n}", MENTIONS_BOT) for n in range(200)}
+        self.assertEqual(seen, {"甲", "乙", "丙"})
+
+    def test_needs_at_least_one_name(self):
+        with self.assertRaises(ValueError):
+            mention_reply(people=["", "  "])
+        self.assertEqual(mention_reply(people="甲").people_count, 1)
+
+
+class MentionIntakeTest(unittest.TestCase):
+    def make(self, **reply_options):
+        log = RecordingLog()
+        outbox = Outbox(10)
+        intake = Intake(
+            {A: B, B: A}, RateLimiter(100, clock=FakeClock()), outbox, 300,
+            mention_reply=mention_reply(**reply_options), log=log, wall_clock=lambda: NOW,
+        )
+        return intake, outbox, log
+
+    def test_mention_queues_the_forward_and_a_reply_to_the_same_group(self):
+        intake, outbox, log = self.make()
+        self.assertEqual(intake.accept(row(msg_source=MENTIONS_BOT)), QUEUED)
+        self.assertEqual(outbox.waiting_for(B), [Forward(A, B, "wxid_x", "hello")])
+        self.assertEqual(
+            outbox.waiting_for(A), [Forward(A, A, "wxid_x", "喵喵喵，我猜你是乙", is_reply=True)]
+        )
+        self.assertEqual(log.lines[-1], ("info", f"Queued a mention reply to wxid_x in {A}"))
+
+    def test_second_mention_within_the_cooldown_is_forwarded_without_a_reply(self):
+        intake, outbox, log = self.make()
+        intake.accept(row(msg_source=MENTIONS_BOT))
+        intake.accept(row(msg_source=MENTIONS_BOT))
+        self.assertEqual(len(outbox.waiting_for(A)), 1)
+        self.assertEqual(len(outbox.waiting_for(B)), 2)
+        self.assertEqual(log.lines[-1], ("info", f"Not replying to a mention from wxid_x in {A}: on cooldown"))
+
+    def test_blocked_or_announcement_mentions_get_no_reply(self):
+        intake, outbox, _ = self.make()
+        intake.accept(row(msg_source=MENTIONS_BOT + b"announcement@all"))
+        self.assertEqual(len(outbox), 0)
+
+
 class BlockedIntakeTest(unittest.TestCase):
     def test_message_with_a_blocked_word_is_not_queued(self):
         intake, outbox, _ = make_intake(blocked=["广告"])
@@ -382,6 +566,14 @@ def line(forward):
 def image(sender, server_id, destination=B):
     source = A if destination == B else B
     return Forward(source, destination, sender, "", image_server_id=server_id)
+
+
+class CombineReplyTest(unittest.TestCase):
+    def test_reply_is_never_combined_with_other_messages(self):
+        reply = Forward(A, A, "bob", "喵", is_reply=True)
+        forwards = [Forward(B, A, "x", "1"), reply, Forward(B, A, "y", "2")]
+        self.assertEqual(combine(forwards, line, 1000, self.fail), ("x: 1", forwards[:1], None, None))
+        self.assertEqual(combine(forwards[1:], line, 1000, self.fail), ("喵", [reply], None, None))
 
 
 class CombineImageTest(unittest.TestCase):
@@ -619,6 +811,82 @@ class RunSenderTest(unittest.TestCase):
         # Nothing is sent for the image, not even its credit line.
         self.assertEqual([text for _, _, text in sends], ["carol: after"])
         self.assertEqual(str(errors[0]), "download broke")
+
+    def run_logged(self, outbox, limiter, count):
+        log = RecordingLog()
+        clock = limiter._clock
+        stop = TimeAdvancingStop(clock)
+        sends = []
+
+        def deliver(destination, text):
+            sends.append(text)
+            stop.stopped = len(sends) == count
+
+        run_sender(
+            outbox, limiter, line, deliver, lambda forward: "file", lambda *args: None,
+            stop, 5, 1000, lambda: 1.0, self.fail, log,
+        )
+        return log
+
+    def test_each_send_is_logged_with_its_size_and_the_queue(self):
+        outbox = Outbox(10)
+        outbox.put(Forward(A, B, "bob", "hi"))
+        outbox.put(Forward(A, B, "carol", "yo"))
+
+        log = self.run_logged(outbox, RateLimiter(5, clock=FakeClock()), 1)
+
+        self.assertEqual(
+            log.lines,
+            # "bob: hi" + newline + "carol: yo" is 17 characters.
+            [("info", f"Sent 2 messages to {B} in one send (17 characters); 0 messages still queued")],
+        )
+
+    def test_global_limit_wait_and_the_send_after_it_are_logged(self):
+        outbox = Outbox(10)
+        outbox.put(Forward(A, B, "bob", "1"))
+
+        def add_more(send_count):
+            if send_count == 1:
+                outbox.put(Forward(A, B, "carol", "2"))
+                outbox.put(Forward(A, B, "dave", "3"))
+
+        clock = FakeClock()
+        log = RecordingLog()
+        stop = TimeAdvancingStop(clock)
+        sends = []
+
+        def deliver(destination, text):
+            sends.append(text)
+            add_more(len(sends))
+            stop.stopped = len(sends) == 2
+
+        run_sender(
+            outbox, RateLimiter(1, clock=clock), line, deliver, self.fail, self.fail,
+            stop, 5, 1000, lambda: 1.0, self.fail, log,
+        )
+
+        self.assertEqual(
+            log.messages(),
+            [
+                # The next two arrive during the first send, so they're already queued.
+                f"Sent 1 message to {B} in one send (6 characters); 2 messages still queued",
+                # The first send was at 5s; the next slot opens at 65s, 59s after the
+                # 6s point where the second round's collect wait ended (5 + 1 pause + 5).
+                "Global limit reached (1 send per minute); waiting 54s with 2 messages queued",
+                (f"Sent 2 messages to {B} in one send (16 characters) after waiting for the "
+                "global limit; 0 messages still queued"),
+            ],
+        )
+        self.assertEqual(log.lines[1][0], "warning")
+
+    def test_image_credit_is_mentioned_in_the_send_log(self):
+        outbox = Outbox(10)
+        outbox.put(Forward(A, B, "bob", "hi"))
+        outbox.put(image("alice", 7))
+
+        log = self.run_logged(outbox, RateLimiter(5, clock=FakeClock()), 1)
+
+        self.assertIn("Sent 1 message and an image credit to", log.messages()[0])
 
     def test_failed_image_send_is_reported_and_sending_continues(self):
         clock = FakeClock()

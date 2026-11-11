@@ -8,6 +8,7 @@ import threading
 import time
 
 from dev.ujhhgtg.wekit.features.api.core import (  # ty: ignore[unresolved-import]
+    WeApi,
     WeDatabaseApi,
     WeDatabaseListenerApi,
     WeMessageApi,
@@ -15,15 +16,10 @@ from dev.ujhhgtg.wekit.features.api.core import (  # ty: ignore[unresolved-impor
 from java import dynamic_proxy  # ty: ignore[unresolved-import]
 
 from .relay_core import (
-    BAD_IMAGE,
-    BLOCKED,
     IMAGE_MESSAGE_TYPE,
-    IMAGE_RATE_LIMITED,
-    QUEUE_FULL,
-    STALE,
-    USER_RATE_LIMITED,
     Forward,
     Intake,
+    MentionReply,
     MessageRow,
     Outbox,
     RateLimiter,
@@ -47,6 +43,23 @@ except ModuleNotFoundError:
     GROUP_A = ""
     GROUP_B = ""
 
+# When someone @mentions the bot, it replies in that group with MENTION_REPLY_FORMAT,
+# filling {person} with a random name. The names may be real people, so they live in
+# plugin/local_config.py too:
+#
+#     MENTION_REPLY_NAMES = ["Name 1", "Name 2"]
+#
+# Without that list, the bot doesn't reply to mentions.
+try:
+    from .local_config import MENTION_REPLY_NAMES
+except ImportError:
+    MENTION_REPLY_NAMES: list[str] = []
+MENTION_REPLY_FORMAT = "喵喵喵，我猜你是{person}"
+
+# Each person gets at most one reply per this many seconds. Replies also count toward
+# GLOBAL_MAX_MESSAGES_PER_MINUTE, and are always sent on their own.
+MENTION_REPLY_COOLDOWN_SECONDS = 60
+
 # Blocked words are private too, so they live in this file next to the plugin, which
 # git ignores. It has one word or phrase per line; blank lines are skipped. Text
 # messages containing any of them are not forwarded. Matching ignores case and
@@ -57,7 +70,7 @@ BLOCKED_WORDS_FILE = "blocked_words.txt"
 # The most messages the bot may send per minute, across both groups. Messages over
 # this limit wait in the queue. Because waiting messages are combined, one send can
 # carry many people's messages.
-GLOBAL_MAX_MESSAGES_PER_MINUTE = 5 # 20
+GLOBAL_MAX_MESSAGES_PER_MINUTE = 20
 
 # The most messages forwarded per minute for one person, across both groups. Messages
 # over this limit are dropped.
@@ -248,6 +261,34 @@ def _deliver_image(
         ctx.log.error(f"Could not forward image {server_id} to {destination}; kept {path}")
 
 
+def _message_source(values) -> bytes | None:
+    """Reads a new message's hidden metadata, used to recognise group announcements.
+
+    WeChat normally includes it in the inserted row. If it doesn't, the row is read
+    back from the database, since it has already been written by this point.
+    """
+    raw = values.getAsByteArray("lvbuffer")
+    if raw is None:
+        server_id = _as_int(values.getAsLong("msgSvrId"))
+        if not server_id:
+            return None
+        rows = WeDatabaseApi.INSTANCE.executeQuery(
+            f"SELECT lvbuffer AS value FROM message WHERE msgSvrId={server_id}", None
+        )
+        raw = None if rows.isEmpty() else rows.get(0).get("value")
+    # NULL arrives as an empty string; a real value arrives as a Java byte array.
+    if raw is None or isinstance(raw, str):
+        return None
+    return bytes(raw)
+
+
+def _own_wechat_id() -> str | None:
+    try:
+        return str(WeApi.INSTANCE.getSelfWxId()) or None
+    except Exception:  # noqa: BLE001 - without it, mentions just go unanswered
+        return None
+
+
 def _log_discovered_group(ctx, group: str) -> None:
     try:
         name = WeDatabaseApi.INSTANCE.getDisplayName(group)
@@ -271,6 +312,18 @@ def setup(ctx) -> None:
     else:
         ctx.log.info(f"Blocked words: on ({blocked_words.count} loaded)")
 
+    mention_reply = None
+    if MENTION_REPLY_NAMES:
+        mention_reply = MentionReply(
+            _own_wechat_id,
+            MENTION_REPLY_FORMAT,
+            MENTION_REPLY_NAMES,
+            MENTION_REPLY_COOLDOWN_SECONDS,
+        )
+        ctx.log.info(f"Mention replies: on ({mention_reply.people_count} names)")
+    else:
+        ctx.log.info("Mention replies: off (no MENTION_REPLY_NAMES in local_config.py)")
+
     stop = threading.Event()
     # Deletions still waiting when the plugin stops are cancelled, keeping those files.
     deletion_timers: list[threading.Timer] = []
@@ -284,6 +337,8 @@ def setup(ctx) -> None:
         MAX_MESSAGE_AGE_SECONDS,
         image_limiter=RateLimiter(MAX_IMAGES_PER_USER_PER_MINUTE) if FORWARD_IMAGES else None,
         blocked_words=blocked_words,
+        mention_reply=mention_reply,
+        log=ctx.log,
     )
     discovered_groups: set[str] = set()
 
@@ -305,7 +360,7 @@ def setup(ctx) -> None:
                         ).start()
                     return
 
-                result = intake.accept(
+                intake.accept(
                     MessageRow(
                         talker=talker,
                         is_send=values.getAsInteger("isSend"),
@@ -313,12 +368,9 @@ def setup(ctx) -> None:
                         content=values.getAsString("content"),
                         server_id=values.getAsLong("msgSvrId"),
                         create_time_ms=values.getAsLong("createTime"),
+                        msg_source=_message_source(values),
                     )
                 )
-                if result in (
-                    USER_RATE_LIMITED, IMAGE_RATE_LIMITED, QUEUE_FULL, STALE, BAD_IMAGE, BLOCKED
-                ):
-                    ctx.log.warning(f"Dropped a message from {talker}: {result}")
             except Exception:
                 ctx.log.exception("Could not process a new message")
 
@@ -338,6 +390,7 @@ def setup(ctx) -> None:
             MAX_COMBINED_CHARACTERS,
             lambda: random.uniform(MIN_SEND_PAUSE_SECONDS, MAX_SEND_PAUSE_SECONDS),
             lambda error: ctx.log.exception(message="Could not forward a message", error=error),
+            ctx.log,
         ),
         name="GroupRelaySender",
         daemon=True,
