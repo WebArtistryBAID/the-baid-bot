@@ -2,7 +2,9 @@
 
 import importlib
 import importlib.machinery
+import re
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -28,9 +30,34 @@ class FakeValues:
     getAsLong = getAsString
 
 
+class FakeRows(list):
+    """Behaves like the java.util.List that WeDatabaseApi.executeQuery returns."""
+
+    def isEmpty(self):
+        return len(self) == 0
+
+    def get(self, index):
+        return self[index]
+
+
 class FakeDatabase:
     def __init__(self):
         self.reader_threads = []
+        # (msgId, talker, isSend, type, status). A real table already holds messages.
+        self.messages = [(1, A, 0, 1, 3)]
+
+    def add_sent_image(self, talker, status):
+        self.messages.append((self.messages[-1][0] + 1, talker, 1, 3, status))
+
+    def executeQuery(self, statement, args):
+        if "MAX(msgId)" in statement:
+            return FakeRows([{"value": self.messages[-1][0] if self.messages else ""}])
+        talker = re.search(r"talker='([^']*)'", statement).group(1)
+        after = int(re.search(r"msgId>(\d+)", statement).group(1))
+        for message_id, row_talker, is_send, message_type, status in self.messages:
+            if (row_talker, is_send, message_type) == (talker, 1, 3) and message_id > after:
+                return FakeRows([{"value": status}])
+        return FakeRows()
 
     def getGroupMemberDisplayName(self, group, wxid):
         self.reader_threads.append(threading.current_thread())
@@ -55,7 +82,8 @@ class FakeLog:
 
 
 class FakeContext:
-    def __init__(self):
+    def __init__(self, root):
+        self.root = root
         self.log = FakeLog()
         self.cleanup = []
 
@@ -92,6 +120,11 @@ def message(talker=A, sender="wxid_nick", text="hello", **overrides):
     return FakeValues(**{**values, **overrides})
 
 
+def image_message(talker=A, sender="wxid_nick", server_id=500):
+    xml = '<?xml version="1.0"?>\n<msg><img length="1"/></msg>'
+    return message(talker=talker, type=3, msgSvrId=server_id, content=f"{sender}:\n{xml}")
+
+
 class PluginMainTest(unittest.TestCase):
     def setUp(self):
         self.sent = []
@@ -109,7 +142,11 @@ class PluginMainTest(unittest.TestCase):
             ),
         )
         core_api.WeMessageApi = SimpleNamespace(
-            INSTANCE=SimpleNamespace(sendText=self.send_text)
+            INSTANCE=SimpleNamespace(
+                sendText=self.send_text,
+                sendImage=self.send_image_file,
+                downloadImage=self.download_image,
+            )
         )
         java = types.ModuleType("java")
         java.dynamic_proxy = lambda interface: interface
@@ -133,10 +170,195 @@ class PluginMainTest(unittest.TestCase):
         self.main.MAX_SEND_PAUSE_SECONDS = 0
         # Long enough for a test's messages to arrive before the first send.
         self.main.COMBINE_WAIT_SECONDS = 0.3
+        self.main.IMAGE_SEND_CHECK_SECONDS = 1
+        self.main.DELETE_IMAGES_AFTER_SECONDS = 0.05
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.plugin_root = Path(directory.name) / "plugin"
+        self.plugin_root.mkdir()
+        self.saved_file = Path(directory.name) / "Download" / "WeKit" / "photo.jpg"
+        self.saved_file.parent.mkdir(parents=True)
+        self.saved_file.write_bytes(b"image bytes")
+        self.download_result = str(self.saved_file)
+        self.events = []
+        # WeChat's status for the uploaded image: 2 sent, 5 failed, None for no message.
+        self.upload_status = 2
+        self.upload_accepted = True
+        self.uploads = []
 
     def send_text(self, destination, text):
+        self.events.append(f"text {text}")
         self.sent.append((destination, text))
         return True
+
+    def send_image_file(self, destination, path):
+        self.events.append(f"image {path}")
+        self.uploads.append((destination, path))
+        self.sent.append((destination, f"<image {Path(path).name}>"))
+        if self.upload_accepted and self.upload_status is not None:
+            self.database.add_sent_image(destination, self.upload_status)
+        return self.upload_accepted
+
+    def download_image(self, server_id):
+        self.events.append(f"download {server_id}")
+        return self.download_result
+
+    def sent_log(self, context, outcome, server_id=500, destination=B):
+        line = f"Image {server_id} to {destination}: {outcome}"
+        return wait_until(lambda: line in context.log.lines)
+
+    def test_image_is_downloaded_then_credited_then_uploaded(self):
+        context, listener = self.start()
+        listener.onInsert("message", message(text="look"))
+        listener.onInsert("message", image_message(server_id=500))
+
+        self.assertTrue(self.sent_log(context, "sent"))
+        self.assertEqual(
+            self.events,
+            [
+                "download 500",
+                "text Group Nick: look\nGroup Nick: [图片] ↓",
+                f"image {self.saved_file}",
+            ],
+        )
+        self.assertEqual(self.uploads, [(B, str(self.saved_file))])
+
+    def test_saved_file_is_deleted_after_a_confirmed_send(self):
+        context, listener = self.start()
+        listener.onInsert("message", image_message(server_id=500))
+
+        self.assertTrue(self.sent_log(context, "sent"))
+        self.assertTrue(wait_until(lambda: not self.saved_file.exists()))
+        self.assertIn("Deleted forwarded image file photo.jpg", context.log.lines)
+
+    def test_image_that_never_appears_is_logged_and_its_file_kept(self):
+        self.upload_status = None
+        context, listener = self.start()
+        listener.onInsert("message", image_message(server_id=500))
+
+        self.assertTrue(self.sent_log(context, "missing"))
+        expected = f"Could not forward image 500 to {B}; kept {self.saved_file}"
+        self.assertTrue(wait_until(lambda: expected in context.log.lines))
+        time.sleep(0.2)
+        self.assertTrue(self.saved_file.exists())
+
+    def test_failed_image_is_logged_and_its_file_kept(self):
+        self.upload_status = 5
+        context, listener = self.start()
+        listener.onInsert("message", image_message(server_id=500))
+
+        self.assertTrue(self.sent_log(context, "failed"))
+        time.sleep(0.2)
+        self.assertTrue(self.saved_file.exists())
+
+    def test_image_wekit_refuses_is_logged(self):
+        self.upload_accepted = False
+        context, listener = self.start()
+        listener.onInsert("message", image_message(server_id=500))
+
+        self.assertTrue(self.sent_log(context, "rejected by WeKit"))
+        self.assertTrue(self.saved_file.exists())
+
+    def test_unfinished_send_is_logged_without_an_error_and_its_file_kept(self):
+        self.upload_status = 1
+        context, listener = self.start()
+        listener.onInsert("message", image_message(server_id=500))
+
+        self.assertTrue(self.sent_log(context, "pending (status 1)"))
+        time.sleep(0.2)
+        self.assertTrue(self.saved_file.exists())
+        self.assertFalse(any("Could not forward image" in line for line in context.log.lines))
+
+    def test_failed_download_skips_the_image_and_its_credit(self):
+        self.download_result = None
+        context, listener = self.start()
+        listener.onInsert("message", message(text="look"))
+        listener.onInsert("message", image_message(server_id=500))
+
+        expected = "Could not download image 500; skipping it"
+        self.assertTrue(wait_until(lambda: expected in context.log.lines))
+        self.assertTrue(wait_until(lambda: self.sent))
+        time.sleep(0.1)
+        self.assertEqual(self.sent, [(B, "Group Nick: look")])
+        self.assertEqual(self.uploads, [])
+
+    def test_deleting_can_be_turned_off(self):
+        self.main.DELETE_FORWARDED_IMAGES = False
+        context, listener = self.start()
+        listener.onInsert("message", image_message(server_id=500))
+
+        self.assertTrue(self.sent_log(context, "sent"))
+        time.sleep(0.2)
+        self.assertTrue(self.saved_file.exists())
+
+    def test_disabling_cancels_pending_deletions(self):
+        self.main.DELETE_IMAGES_AFTER_SECONDS = 0.5
+        context, listener = self.start()
+        listener.onInsert("message", image_message(server_id=500))
+
+        self.assertTrue(self.sent_log(context, "sent"))
+        context.close()
+        context.cleanup.clear()
+        time.sleep(0.8)
+        self.assertTrue(self.saved_file.exists())
+
+    def write_blocked_words(self, text):
+        (self.plugin_root / "blocked_words.txt").write_text(text, encoding="utf-8")
+
+    def test_without_a_blocked_words_file_nothing_is_blocked(self):
+        context, listener = self.start()
+        listener.onInsert("message", message(text="免费广告"))
+
+        self.assertTrue(wait_until(lambda: self.sent))
+        self.assertEqual(self.sent, [(B, "Group Nick: 免费广告")])
+        self.assertIn("Blocked words: off (blocked_words.txt not found)", context.log.lines)
+
+    def test_blocked_words_file_is_loaded_and_counted(self):
+        self.write_blocked_words("广告\n\n  spam  \n广告\n")
+        context, _ = self.start()
+        self.assertIn("Blocked words: on (2 loaded)", context.log.lines)
+
+    def test_unreadable_blocked_words_file_stops_the_plugin(self):
+        (self.plugin_root / "blocked_words.txt").write_bytes(b"\xff\xfe\xfa not utf-8")
+        with self.assertRaises(UnicodeDecodeError):
+            self.start()
+        self.assertEqual(self.listeners, [])
+
+    def test_blocked_words_file_is_applied_and_logged(self):
+        self.write_blocked_words("广告\n")
+        context, listener = self.start()
+        listener.onInsert("message", message(text="免费广告"))
+        listener.onInsert("message", message(text="你好"))
+
+        self.assertTrue(wait_until(lambda: self.sent))
+        time.sleep(0.05)
+        self.assertEqual(self.sent, [(B, "Group Nick: 你好")])
+        self.assertIn(f"Dropped a message from {A}: blocked", context.log.lines)
+        # The log never contains the blocked message itself.
+        self.assertFalse(any("免费广告" in line for line in context.log.lines))
+
+    def test_images_are_ignored_when_turned_off(self):
+        self.main.FORWARD_IMAGES = False
+        _, listener = self.start()
+        listener.onInsert("message", image_message(server_id=500))
+        listener.onInsert("message", message(text="text still works"))
+
+        self.assertTrue(wait_until(lambda: self.sent))
+        time.sleep(0.05)
+        self.assertEqual(self.sent, [(B, "Group Nick: text still works")])
+        self.assertNotIn("download 500", self.events)
+
+    def test_image_limit_constant_is_applied_and_logged(self):
+        self.main.MAX_IMAGES_PER_USER_PER_MINUTE = 1
+        context, listener = self.start()
+        listener.onInsert("message", image_message(server_id=500))
+        listener.onInsert("message", image_message(server_id=501))
+
+        self.assertTrue(wait_until(lambda: self.uploads))
+        time.sleep(0.05)
+        self.assertEqual(len(self.uploads), 1)
+        self.assertTrue(any("image_rate_limited" in line for line in context.log.lines))
 
     def reload_main_with_local_config(self, local_config):
         sys.modules.pop(f"{NAMESPACE}.main")
@@ -164,7 +386,7 @@ class PluginMainTest(unittest.TestCase):
     def start(self, group_a=A, group_b=B):
         self.main.GROUP_A = group_a
         self.main.GROUP_B = group_b
-        context = FakeContext()
+        context = FakeContext(self.plugin_root)
         self.main.setup(context)
         self.addCleanup(context.close)
         self.contexts.append(context)

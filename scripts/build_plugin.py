@@ -14,6 +14,10 @@ def main() -> None:
     output.parent.mkdir(exist_ok=True)
 
     files = [PLUGIN_DIR / "plugin.json", *sorted(PLUGIN_DIR.glob("*.py"))]
+    # Optional and private, so it's only included when it exists.
+    blocked_words = PLUGIN_DIR / "blocked_words.txt"
+    if blocked_words.exists():
+        files.append(blocked_words)
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         for file in files:
             archive.write(file, file.name)

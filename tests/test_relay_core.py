@@ -1,4 +1,6 @@
+import random
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -6,18 +8,25 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "plugin"))
 
 from relay_core import (
+    BAD_IMAGE,
+    BLOCKED,
     DUPLICATE,
     IGNORED,
+    IMAGE_MESSAGE_TYPE,
+    IMAGE_RATE_LIMITED,
     QUEUE_FULL,
     QUEUED,
     STALE,
     USER_RATE_LIMITED,
+    BlockedWords,
     Forward,
     Intake,
     MessageRow,
     Outbox,
     RateLimiter,
     combine,
+    load_blocked_words,
+    normalise_for_matching,
     parse_group_content,
     run_sender,
 )
@@ -47,11 +56,32 @@ def row(**overrides):
     return MessageRow(**{**values, **overrides})
 
 
-def make_intake(user_limit=100, max_queue=100):
+IMAGE_XML = '<?xml version="1.0"?>\n<msg>\n\t<img aeskey="k" length="2048" />\n</msg>\n'
+
+
+def image_row(sender="wxid_x", server_id=500, content=None, **overrides):
+    return row(
+        msg_type=IMAGE_MESSAGE_TYPE,
+        content=content if content is not None else f"{sender}:\n{IMAGE_XML}",
+        server_id=server_id,
+        **overrides,
+    )
+
+
+def make_intake(user_limit=100, max_queue=100, image_limit=None, blocked=()):
     outbox = Outbox(max_queue)
     clock = FakeClock()
     limiter = RateLimiter(user_limit, clock=clock)
-    intake = Intake({A: B, B: A}, limiter, outbox, 300, wall_clock=lambda: NOW)
+    image_limiter = RateLimiter(image_limit, clock=clock) if image_limit else None
+    intake = Intake(
+        {A: B, B: A},
+        limiter,
+        outbox,
+        300,
+        image_limiter=image_limiter,
+        blocked_words=BlockedWords(blocked),
+        wall_clock=lambda: NOW,
+    )
     return intake, outbox, clock
 
 
@@ -111,6 +141,165 @@ class ParseTest(unittest.TestCase):
     def test_rejects_unexpected_content(self):
         for content in (None, "", "no separator", ":\nno sender", "wxid_x:\n"):
             self.assertIsNone(parse_group_content(content))
+
+
+class BlockedWordsTest(unittest.TestCase):
+    def test_matches_words_inside_longer_text(self):
+        words = BlockedWords(["广告", "spam"])
+        self.assertTrue(words.matches("这是广告，欢迎购买"))
+        self.assertTrue(words.matches("no spamming please"))
+        self.assertFalse(words.matches("一条普通的消息"))
+
+    def test_ignores_case_and_full_width_characters(self):
+        words = BlockedWords(["Spam", "ＶＰＮ"])
+        self.assertTrue(words.matches("SPAM here"))
+        self.assertTrue(words.matches("ｓｐａｍ"))
+        self.assertTrue(words.matches("cheap vpn"))
+
+    def test_blank_entries_never_block_everything(self):
+        words = BlockedWords(["", "   "])
+        self.assertFalse(words.matches("hello"))
+        self.assertFalse(BlockedWords([]).matches("hello"))
+
+    def test_a_single_string_is_one_word_not_its_letters(self):
+        words = BlockedWords("spam")
+        self.assertTrue(words.matches("spam"))
+        self.assertFalse(words.matches("a plain message"))
+
+    def test_overlapping_and_nested_words(self):
+        # Classic Aho-Corasick cases: words inside words, and a failed partial match
+        # ("hers" broken off) that must fall back to a shorter word ("she", "he").
+        words = BlockedWords(["he", "she", "his", "hers"])
+        for text, expected in {
+            "ushers": True,
+            "shx": False,
+            "ahishers": True,
+            "this": True,
+            "hx": False,
+            "sh": False,
+        }.items():
+            with self.subTest(text):
+                self.assertEqual(words.matches(text), expected)
+
+        self.assertTrue(BlockedWords(["abcd", "bc"]).matches("abce"))
+        self.assertFalse(BlockedWords(["abcd", "bce"]).matches("abcf"))
+        self.assertTrue(BlockedWords(["aab"]).matches("aaab"))
+
+    def test_agrees_with_a_simple_search_on_random_text(self):
+        rng = random.Random(7)
+        alphabet = "ab广告"
+        for _ in range(300):
+            words = ["".join(rng.choice(alphabet) for _ in range(rng.randint(1, 4)))
+                     for _ in range(rng.randint(1, 6))]
+            text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 12)))
+            expected = any(normalise_for_matching(w) in normalise_for_matching(text) for w in words)
+            with self.subTest(words=words, text=text):
+                self.assertEqual(BlockedWords(words).matches(text), expected)
+
+    def test_count_ignores_duplicates_and_blanks(self):
+        self.assertEqual(BlockedWords(["a", "A", " a ", "", "b"]).count, 2)
+
+    def test_surrounding_spaces_in_a_word_are_ignored(self):
+        self.assertTrue(BlockedWords([" spam "]).matches("spam!"))
+
+
+class LoadBlockedWordsTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "blocked_words.txt"
+
+    def test_missing_file_turns_the_feature_off(self):
+        self.assertIsNone(load_blocked_words(self.path))
+
+    def test_reads_one_item_per_line(self):
+        self.path.write_text("广告\r\n\n  free money  \n代购", encoding="utf-8")
+        words = load_blocked_words(self.path)
+        self.assertEqual(words.count, 3)
+        self.assertTrue(words.matches("get FREE MONEY now"))
+        self.assertTrue(words.matches("海外代购"))
+        self.assertFalse(words.matches("free"))
+
+    def test_byte_order_mark_is_ignored(self):
+        self.path.write_bytes("\ufeff广告\n".encode())
+        self.assertTrue(load_blocked_words(self.path).matches("广告"))
+
+    def test_empty_file_blocks_nothing(self):
+        self.path.write_text("", encoding="utf-8")
+        words = load_blocked_words(self.path)
+        self.assertEqual(words.count, 0)
+        self.assertFalse(words.matches("anything"))
+
+    def test_unreadable_file_raises(self):
+        self.path.write_bytes(b"\xff\xfe\xfa")
+        with self.assertRaises(UnicodeDecodeError):
+            load_blocked_words(self.path)
+
+
+class BlockedIntakeTest(unittest.TestCase):
+    def test_message_with_a_blocked_word_is_not_queued(self):
+        intake, outbox, _ = make_intake(blocked=["广告"])
+        self.assertEqual(intake.accept(row(content="wxid_x:\n免费广告")), BLOCKED)
+        self.assertEqual(len(outbox), 0)
+        self.assertEqual(intake.accept(row(content="wxid_x:\n你好")), QUEUED)
+
+    def test_blocked_message_does_not_use_the_sender_quota(self):
+        intake, _, _ = make_intake(user_limit=1, blocked=["spam"])
+        self.assertEqual(intake.accept(row(content="wxid_x:\nspam")), BLOCKED)
+        self.assertEqual(intake.accept(row(content="wxid_x:\nhello")), QUEUED)
+
+    def test_blocking_applies_in_both_directions(self):
+        intake, _, _ = make_intake(blocked=["spam"])
+        self.assertEqual(intake.accept(row(talker=B, content="wxid_x:\nspam")), BLOCKED)
+
+    def test_images_are_not_checked(self):
+        # An image's content is XML, so a blocked word inside it must not block the image.
+        intake, _, _ = make_intake(image_limit=3, blocked=["img"])
+        self.assertEqual(intake.accept(image_row()), QUEUED)
+
+
+class ImageIntakeTest(unittest.TestCase):
+    def test_images_are_ignored_unless_enabled(self):
+        intake, outbox, _ = make_intake()
+        self.assertEqual(intake.accept(image_row()), IGNORED)
+        self.assertEqual(len(outbox), 0)
+
+    def test_image_is_queued_with_its_server_id(self):
+        intake, outbox, _ = make_intake(image_limit=3)
+        self.assertEqual(intake.accept(image_row(server_id=500)), QUEUED)
+        forward = outbox.waiting_for(B)[0]
+        self.assertTrue(forward.is_image)
+        self.assertEqual((forward.sender, forward.text), ("wxid_x", ""))
+        self.assertEqual(forward.image_server_id, 500)
+
+    def test_image_without_a_server_id_is_dropped(self):
+        intake, outbox, _ = make_intake(image_limit=3)
+        self.assertEqual(intake.accept(image_row(server_id=None)), BAD_IMAGE)
+        self.assertEqual(len(outbox), 0)
+
+    def test_own_image_is_ignored(self):
+        intake, _, _ = make_intake(image_limit=3)
+        self.assertEqual(intake.accept(image_row(is_send=1)), IGNORED)
+
+    def test_image_limit_is_per_person_and_resets(self):
+        intake, _, clock = make_intake(image_limit=2)
+        self.assertEqual(intake.accept(image_row(server_id=1)), QUEUED)
+        self.assertEqual(intake.accept(image_row(server_id=2)), QUEUED)
+        self.assertEqual(intake.accept(image_row(server_id=3)), IMAGE_RATE_LIMITED)
+        self.assertEqual(intake.accept(image_row(sender="wxid_y", server_id=4)), QUEUED)
+        clock.now = 60
+        self.assertEqual(intake.accept(image_row(server_id=5)), QUEUED)
+
+    def test_refused_image_does_not_use_the_message_quota(self):
+        intake, _, _ = make_intake(user_limit=2, image_limit=1)
+        self.assertEqual(intake.accept(image_row(server_id=1)), QUEUED)
+        self.assertEqual(intake.accept(image_row(server_id=2)), IMAGE_RATE_LIMITED)
+        self.assertEqual(intake.accept(row()), QUEUED)
+
+    def test_images_count_toward_the_message_quota(self):
+        intake, _, _ = make_intake(user_limit=1, image_limit=5)
+        self.assertEqual(intake.accept(image_row()), QUEUED)
+        self.assertEqual(intake.accept(row()), USER_RATE_LIMITED)
 
 
 class IntakeTest(unittest.TestCase):
@@ -185,7 +374,35 @@ class TimeAdvancingStop:
 
 
 def line(forward):
+    if forward.is_image:
+        return f"{forward.sender}: [image]"
     return f"{forward.sender}: {forward.text}"
+
+
+def image(sender, server_id, destination=B):
+    source = A if destination == B else B
+    return Forward(source, destination, sender, "", image_server_id=server_id)
+
+
+class CombineImageTest(unittest.TestCase):
+    def test_stops_at_an_image_and_ends_with_its_credit(self):
+        photo = image("alice", 7)
+        forwards = [Forward(A, B, "bob", "hi"), photo, Forward(A, B, "carol", "after")]
+        text, used, next_image, credit = combine(forwards, line, 1000, self.fail)
+        self.assertEqual(text, "bob: hi")
+        self.assertEqual(credit, "alice: [image]")
+        self.assertEqual(used, forwards[:2])
+        self.assertIs(next_image, photo)
+
+    def test_image_whose_credit_does_not_fit_waits_for_the_next_send(self):
+        forwards = [Forward(A, B, "bob", "hi"), image("alice", 7)]
+        result = combine(forwards, line, len("bob: hi"), self.fail)
+        self.assertEqual(result, ("bob: hi", forwards[:1], None, None))
+
+    def test_image_first_gets_its_credit_alone(self):
+        photo = image("alice", 7)
+        result = combine([photo], line, 1000, self.fail)
+        self.assertEqual(result, ("", [photo], photo, "alice: [image]"))
 
 
 class OutboxTest(unittest.TestCase):
@@ -225,13 +442,13 @@ class CombineTest(unittest.TestCase):
     def test_joins_lines_until_the_limit(self):
         forwards = [Forward(A, B, "x", str(number)) for number in range(3)]
         # Each line is "x: N" (4 characters), so two lines with a newline take 9.
-        text, used = combine(forwards, line, 9, self.fail)
+        text, used, _, _ = combine(forwards, line, 9, self.fail)
         self.assertEqual(text, "x: 0\nx: 1")
         self.assertEqual(used, forwards[:2])
 
     def test_first_message_is_used_even_if_too_long(self):
         forwards = [Forward(A, B, "x", "a long message"), Forward(A, B, "x", "short")]
-        text, used = combine(forwards, line, 5, self.fail)
+        text, used, _, _ = combine(forwards, line, 5, self.fail)
         self.assertEqual(text, "x: a long message")
         self.assertEqual(used, forwards[:1])
 
@@ -245,25 +462,40 @@ class CombineTest(unittest.TestCase):
                 raise RuntimeError("boom")
             return line(forward)
 
-        text, used = combine([bad, good], format_line, 100, errors.append)
+        text, used, _, _ = combine([bad, good], format_line, 100, errors.append)
         self.assertEqual(text, "x: good")
         self.assertEqual(used, [bad, good])
         self.assertEqual(str(errors[0]), "boom")
 
 
 class RunSenderTest(unittest.TestCase):
-    def run_until_sends(self, outbox, limiter, count, *, max_characters=1000, on_send=None):
+    def run_until_sends(
+        self, outbox, limiter, count, *, max_characters=1000, on_send=None, prepare=None,
+        events=None, on_error=None,
+    ):
+        events = events if events is not None else []
         clock = limiter._clock
         stop = TimeAdvancingStop(clock)
         sends = []
 
         def deliver(destination, text):
+            events.append(f"send {text}")
             sends.append((clock.now, destination, text))
             if on_send:
                 on_send(len(sends))
             stop.stopped = len(sends) == count
 
-        run_sender(outbox, limiter, line, deliver, stop, 5, max_characters, lambda: 1.0, self.fail)
+        def prepare_image(forward):
+            events.append(f"prepare {forward.image_server_id}")
+            return prepare(forward) if prepare else f"file {forward.image_server_id}"
+
+        def deliver_image(destination, forward, prepared):
+            deliver(destination, f"<image {forward.image_server_id} from {prepared}>")
+
+        run_sender(
+            outbox, limiter, line, deliver, prepare_image, deliver_image,
+            stop, 5, max_characters, lambda: 1.0, on_error or self.fail,
+        )
         return sends
 
     def test_waiting_messages_for_a_group_go_out_as_one_send(self):
@@ -320,6 +552,98 @@ class RunSenderTest(unittest.TestCase):
 
         self.assertEqual(len(sends[0][2].splitlines()), 50)
 
+    def test_image_is_sent_right_after_its_credit_and_counts_as_a_send(self):
+        outbox = Outbox(10)
+        outbox.put(Forward(A, B, "bob", "hi"))
+        outbox.put(image("alice", 7))
+        outbox.put(Forward(A, B, "carol", "after"))
+
+        sends = self.run_until_sends(outbox, RateLimiter(2, clock=FakeClock()), 3)
+
+        # Two sends fit in the first minute; the third waits for the limit to reset.
+        self.assertEqual(
+            sends,
+            [
+                (5, B, "bob: hi\nalice: [image]"),
+                (6, B, "<image 7 from file 7>"),
+                (65, B, "carol: after"),
+            ],
+        )
+
+    def test_image_waits_for_the_global_limit_after_its_credit(self):
+        outbox = Outbox(10)
+        outbox.put(image("alice", 7))
+
+        sends = self.run_until_sends(outbox, RateLimiter(1, clock=FakeClock()), 2)
+
+        self.assertEqual(sends, [(5, B, "alice: [image]"), (65, B, "<image 7 from file 7>")])
+
+    def test_image_is_prepared_before_its_credit_is_sent(self):
+        outbox = Outbox(10)
+        outbox.put(Forward(A, B, "bob", "hi"))
+        outbox.put(image("alice", 7))
+        events = []
+
+        self.run_until_sends(outbox, RateLimiter(5, clock=FakeClock()), 2, events=events)
+
+        self.assertEqual(
+            events,
+            ["prepare 7", "send bob: hi\nalice: [image]", "send <image 7 from file 7>"],
+        )
+
+    def test_image_that_cannot_be_prepared_is_dropped_with_its_credit(self):
+        outbox = Outbox(10)
+        outbox.put(Forward(A, B, "bob", "hi"))
+        outbox.put(image("alice", 7))
+        outbox.put(Forward(A, B, "carol", "after"))
+
+        sends = self.run_until_sends(
+            outbox, RateLimiter(5, clock=FakeClock()), 2, prepare=lambda forward: None
+        )
+
+        self.assertEqual([text for _, _, text in sends], ["bob: hi", "carol: after"])
+
+    def test_image_whose_preparation_raises_is_reported_and_dropped(self):
+        outbox = Outbox(10)
+        outbox.put(image("alice", 7))
+        outbox.put(Forward(A, B, "carol", "after"))
+        errors = []
+
+        def explode(forward):
+            raise RuntimeError("download broke")
+
+        sends = self.run_until_sends(
+            outbox, RateLimiter(5, clock=FakeClock()), 1, prepare=explode, on_error=errors.append
+        )
+
+        # Nothing is sent for the image, not even its credit line.
+        self.assertEqual([text for _, _, text in sends], ["carol: after"])
+        self.assertEqual(str(errors[0]), "download broke")
+
+    def test_failed_image_send_is_reported_and_sending_continues(self):
+        clock = FakeClock()
+        outbox = Outbox(10)
+        outbox.put(image("alice", 7))
+        stop = TimeAdvancingStop(clock)
+        errors = []
+        texts = []
+
+        def deliver(destination, text):
+            texts.append(text)
+            stop.stopped = len(texts) == 2
+
+        def deliver_image(destination, forward, prepared):
+            outbox.put(Forward(A, B, "bob", "next"))
+            raise RuntimeError("image failed")
+
+        run_sender(
+            outbox, RateLimiter(5, clock=clock), line, deliver, lambda forward: "file",
+            deliver_image, stop, 0, 1000, lambda: 0, errors.append,
+        )
+
+        self.assertEqual(texts, ["alice: [image]", "bob: next"])
+        self.assertEqual(str(errors[0]), "image failed")
+
     def test_failed_send_is_reported_and_sending_continues(self):
         clock = FakeClock()
         outbox = Outbox(10)
@@ -336,7 +660,8 @@ class RunSenderTest(unittest.TestCase):
             stop.stopped = True
 
         run_sender(
-            outbox, RateLimiter(5, clock=clock), line, deliver, stop, 0, 1000, lambda: 0, errors.append
+            outbox, RateLimiter(5, clock=clock), line, deliver, self.fail, self.fail,
+            stop, 0, 1000, lambda: 0, errors.append,
         )
 
         self.assertEqual(delivered, ["x: good"])
@@ -357,7 +682,9 @@ class RunSenderTest(unittest.TestCase):
 
         stop.wait = wait
 
-        run_sender(outbox, limiter, line, self.fail, stop, 0, 1000, lambda: 0, self.fail)
+        run_sender(
+            outbox, limiter, line, self.fail, self.fail, self.fail, stop, 0, 1000, lambda: 0, self.fail
+        )
         self.assertEqual(len(outbox), 1)
 
 
