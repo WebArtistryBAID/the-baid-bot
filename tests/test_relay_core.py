@@ -10,14 +10,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "plugin"))
 from relay_core import (
     ANNOUNCEMENT,
     BAD_IMAGE,
+    BAD_STICKER,
     BLOCKED,
+    BLOCKED_USER,
     DUPLICATE,
     IGNORED,
     IMAGE_MESSAGE_TYPE,
     IMAGE_RATE_LIMITED,
     QUEUE_FULL,
     QUEUED,
+    QUOTE_MESSAGE_TYPE,
     STALE,
+    STICKER_MESSAGE_TYPE,
+    STICKER_RATE_LIMITED,
     USER_RATE_LIMITED,
     BlockedWords,
     Forward,
@@ -26,13 +31,18 @@ from relay_core import (
     MessageRow,
     Outbox,
     RateLimiter,
+    UserBlocker,
     combine,
+    expand_replies,
     is_announcement,
     load_blocked_words,
     mentioned_users,
     normalise_for_matching,
     parse_group_content,
+    parse_quote_text,
     run_sender,
+    sticker_kind,
+    sticker_md5,
 )
 
 A = "a@chatroom"
@@ -89,17 +99,21 @@ class RecordingLog:
         return [message for _, message in self.lines]
 
 
-def make_intake(user_limit=100, max_queue=100, image_limit=None, blocked=(), log=None):
+def make_intake(
+    user_limit=100, max_queue=100, image_limit=None, blocked=(), log=None, sticker_limit=None
+):
     outbox = Outbox(max_queue)
     clock = FakeClock()
     limiter = RateLimiter(user_limit, clock=clock)
     image_limiter = RateLimiter(image_limit, clock=clock) if image_limit else None
+    sticker_limiter = RateLimiter(sticker_limit, clock=clock) if sticker_limit else None
     intake = Intake(
         {A: B, B: A},
         limiter,
         outbox,
         300,
         image_limiter=image_limiter,
+        sticker_limiter=sticker_limiter,
         blocked_words=BlockedWords(blocked),
         log=log,
         wall_clock=lambda: NOW,
@@ -338,10 +352,9 @@ MENTIONS_BOT = b"<msgsource><atuserlist><![CDATA[,wxid_a, wxid_bot]]></atuserlis
 def mention_reply(people=("甲", "乙"), cooldown=60, clock=None, own_id="wxid_bot"):
     return MentionReply(
         lambda: own_id,
-        "喵喵喵，我猜你是{person}",
-        list(people),
+        expand_replies(["喵喵喵，我猜你是{person}"], people),
         cooldown,
-        choose=lambda names: names[-1],
+        choose=lambda replies: replies[-1],
         clock=clock or FakeClock(),
     )
 
@@ -376,15 +389,33 @@ class MentionReplyTest(unittest.TestCase):
         clock.now = 60
         self.assertIsInstance(reply.reply_to("wxid_x", MENTIONS_BOT), str)
 
-    def test_picks_from_the_people_given(self):
-        reply = MentionReply(lambda: "wxid_bot", "{person}", ["甲", "乙", "丙"], 0.0)
+    def test_picks_every_reply_at_random(self):
+        reply = MentionReply(lambda: "wxid_bot", ["甲", "乙", "丙"], 0.0)
         seen = {reply.reply_to(f"wxid_{n}", MENTIONS_BOT) for n in range(200)}
         self.assertEqual(seen, {"甲", "乙", "丙"})
 
-    def test_needs_at_least_one_name(self):
+    def test_needs_at_least_one_reply(self):
         with self.assertRaises(ValueError):
             mention_reply(people=["", "  "])
-        self.assertEqual(mention_reply(people="甲").people_count, 1)
+        self.assertEqual(mention_reply(people="甲").reply_count, 1)
+
+
+class ExpandRepliesTest(unittest.TestCase):
+    def test_person_entries_count_once_per_name(self):
+        replies = expand_replies(["猜你是{person}", "名言", "{person}，你好"], ["甲", " 乙 ", ""])
+        self.assertEqual(replies, ["猜你是甲", "猜你是乙", "名言", "甲，你好", "乙，你好"])
+
+    def test_person_entries_are_left_out_without_names(self):
+        self.assertEqual(expand_replies(["猜你是{person}", "名言"], []), ["名言"])
+
+    def test_blank_entries_are_left_out(self):
+        self.assertEqual(expand_replies(["", "  ", "名言"], ["甲"]), ["名言"])
+
+    def test_a_single_name_string_is_one_name(self):
+        self.assertEqual(expand_replies(["{person}"], "甲乙"), ["甲乙"])
+
+    def test_other_braces_are_kept_as_they_are(self):
+        self.assertEqual(expand_replies(["{not a field} {person}"], ["甲"]), ["{not a field} 甲"])
 
 
 class MentionIntakeTest(unittest.TestCase):
@@ -397,27 +428,154 @@ class MentionIntakeTest(unittest.TestCase):
         )
         return intake, outbox, log
 
-    def test_mention_queues_the_forward_and_a_reply_to_the_same_group(self):
+    def test_mention_queues_the_forward_and_a_reply_to_both_groups(self):
         intake, outbox, log = self.make()
         self.assertEqual(intake.accept(row(msg_source=MENTIONS_BOT)), QUEUED)
-        self.assertEqual(outbox.waiting_for(B), [Forward(A, B, "wxid_x", "hello")])
+        reply = "喵喵喵，我猜你是乙"
+        self.assertEqual(outbox.waiting_for(A), [Forward(A, A, "wxid_x", reply, is_reply=True)])
+        # In the other group, the reply comes after the forwarded mention.
         self.assertEqual(
-            outbox.waiting_for(A), [Forward(A, A, "wxid_x", "喵喵喵，我猜你是乙", is_reply=True)]
+            outbox.waiting_for(B),
+            [Forward(A, B, "wxid_x", "hello"), Forward(A, B, "wxid_x", reply, is_reply=True)],
         )
-        self.assertEqual(log.lines[-1], ("info", f"Queued a mention reply to wxid_x in {A}"))
+        self.assertEqual(
+            log.lines[-1],
+            ("info", f"Queued a mention reply to wxid_x (mentioned in {A}) for {A} and {B}"),
+        )
+
+    def test_mention_in_the_other_group_replies_there_first(self):
+        intake, outbox, log = self.make()
+        intake.accept(row(talker=B, msg_source=MENTIONS_BOT))
+        self.assertEqual(
+            log.lines[-1],
+            ("info", f"Queued a mention reply to wxid_x (mentioned in {B}) for {B} and {A}"),
+        )
+        self.assertEqual(len(outbox), 3)
 
     def test_second_mention_within_the_cooldown_is_forwarded_without_a_reply(self):
         intake, outbox, log = self.make()
         intake.accept(row(msg_source=MENTIONS_BOT))
         intake.accept(row(msg_source=MENTIONS_BOT))
+        # One reply in each group, and both mentions forwarded.
         self.assertEqual(len(outbox.waiting_for(A)), 1)
-        self.assertEqual(len(outbox.waiting_for(B)), 2)
+        self.assertEqual(len(outbox.waiting_for(B)), 3)
         self.assertEqual(log.lines[-1], ("info", f"Not replying to a mention from wxid_x in {A}: on cooldown"))
 
     def test_blocked_or_announcement_mentions_get_no_reply(self):
         intake, outbox, _ = self.make()
         intake.accept(row(msg_source=MENTIONS_BOT + b"announcement@all"))
         self.assertEqual(len(outbox), 0)
+
+
+class UserBlockerTest(unittest.TestCase):
+    def test_listed_people_are_always_blocked(self):
+        blocker = UserBlocker(["wxid_bad", " ", ""], None)
+        self.assertEqual(blocker.check("wxid_bad"), UserBlocker.LISTED)
+        self.assertIsNone(blocker.check("wxid_ok"))
+        self.assertEqual(blocker.listed_count, 1)
+
+    def test_a_single_id_string_is_one_id(self):
+        self.assertEqual(UserBlocker("wxid_bad", None).check("wxid_bad"), UserBlocker.LISTED)
+
+    def test_going_over_the_limit_starts_a_block_until_it_runs_out(self):
+        clock = FakeClock()
+        blocker = UserBlocker([], 3, window_seconds=60, block_seconds=120, clock=clock)
+        self.assertEqual([blocker.check("wxid_x") for _ in range(3)], [None, None, None])
+        self.assertEqual(blocker.check("wxid_x"), UserBlocker.STARTED)
+        clock.now = 119
+        self.assertEqual(blocker.check("wxid_x"), UserBlocker.ONGOING)
+        clock.now = 120
+        self.assertEqual(blocker.check("wxid_x"), UserBlocker.ENDED)
+        self.assertIsNone(blocker.check("wxid_x"))
+
+    def test_only_messages_in_the_window_count(self):
+        clock = FakeClock()
+        blocker = UserBlocker([], 3, window_seconds=60, block_seconds=120, clock=clock)
+        for _ in range(3):
+            blocker.check("wxid_x")
+        clock.now = 60
+        self.assertIsNone(blocker.check("wxid_x"))
+
+    def test_messages_during_a_block_keep_counting(self):
+        clock = FakeClock()
+        blocker = UserBlocker([], 2, window_seconds=60, block_seconds=30, clock=clock)
+        for _ in range(3):
+            blocker.check("wxid_x")
+        clock.now = 29
+        blocker.check("wxid_x")
+        clock.now = 30
+        # Still well over the limit within the hour, so the block starts again.
+        self.assertEqual(blocker.check("wxid_x"), UserBlocker.STARTED)
+
+    def test_people_are_counted_separately(self):
+        blocker = UserBlocker([], 1, clock=FakeClock())
+        blocker.check("wxid_x")
+        self.assertEqual(blocker.check("wxid_x"), UserBlocker.STARTED)
+        self.assertIsNone(blocker.check("wxid_y"))
+
+    def test_listed_people_are_not_counted_and_none_turns_counting_off(self):
+        blocker = UserBlocker(["wxid_bad"], None, clock=FakeClock())
+        for _ in range(1000):
+            self.assertIsNone(blocker.check("wxid_ok"))
+
+
+class UserBlockIntakeTest(unittest.TestCase):
+    def make(self, listed=(), max_messages=None, **options):
+        log = RecordingLog()
+        clock = FakeClock()
+        outbox = Outbox(100)
+        blocker = UserBlocker(list(listed), max_messages, window_seconds=3600, block_seconds=7200, clock=clock)
+        intake = Intake(
+            {A: B, B: A}, RateLimiter(100, clock=clock), outbox, 300,
+            user_blocker=blocker, log=log, wall_clock=lambda: NOW, **options,
+        )
+        return intake, outbox, log, clock
+
+    def test_listed_person_is_not_forwarded_and_uses_no_quota(self):
+        intake, outbox, log, _ = self.make(listed=["wxid_x"])
+        self.assertEqual(intake.accept(row()), BLOCKED_USER)
+        self.assertEqual(intake.accept(image_row()), BLOCKED_USER)
+        self.assertEqual(intake.accept(row(content="wxid_y:\nhi")), QUEUED)
+        self.assertEqual(len(outbox), 1)
+        self.assertEqual(log.lines[0], ("debug", f"Skipped a message from wxid_x in {A}: on the blocklist"))
+
+    def test_listed_person_gets_no_mention_reply(self):
+        intake, outbox, _, _ = self.make(listed=["wxid_x"], mention_reply=mention_reply())
+        intake.accept(row(msg_source=MENTIONS_BOT))
+        self.assertEqual(len(outbox), 0)
+
+    def test_stickers_count_toward_the_automatic_block(self):
+        intake, outbox, _log, _ = self.make(max_messages=3)
+        for _ in range(3):
+            self.assertEqual(intake.accept(row(msg_type=47, content="wxid_x:\n<emoji/>")), IGNORED)
+        self.assertEqual(intake.accept(row()), BLOCKED_USER)
+        self.assertEqual(len(outbox), 0)
+
+    def test_starting_a_block_drops_their_waiting_messages_only(self):
+        intake, outbox, log, _ = self.make(max_messages=2)
+        intake.accept(row(content="wxid_y:\nkeep me"))
+        intake.accept(row())
+        intake.accept(row())
+        self.assertEqual(len(outbox), 3)
+        self.assertEqual(intake.accept(row()), BLOCKED_USER)
+        self.assertEqual([f.sender for f in outbox.waiting_for(B)], ["wxid_y"])
+        self.assertEqual(
+            log.lines[-1],
+            ("warning", (f"Blocked wxid_x for sending too many messages (last seen in {A}); "
+                        "dropped 2 waiting messages")),
+        )
+
+    def test_block_lasts_two_hours_then_ends_with_a_log_line(self):
+        intake, _, log, clock = self.make(max_messages=2)
+        for _ in range(3):
+            intake.accept(row())
+        # This message counts toward the next hour too, but one alone stays under 2.
+        clock.now = 7199
+        self.assertEqual(intake.accept(row()), BLOCKED_USER)
+        self.assertEqual(log.lines[-1], ("debug", f"Skipped a message from wxid_x in {A}: temporarily blocked"))
+        clock.now = 7200
+        self.assertEqual(intake.accept(row()), QUEUED)
+        self.assertIn(("info", "Temporary block on wxid_x has ended"), log.lines)
 
 
 class BlockedIntakeTest(unittest.TestCase):
@@ -452,9 +610,9 @@ class ImageIntakeTest(unittest.TestCase):
         intake, outbox, _ = make_intake(image_limit=3)
         self.assertEqual(intake.accept(image_row(server_id=500)), QUEUED)
         forward = outbox.waiting_for(B)[0]
-        self.assertTrue(forward.is_image)
+        self.assertTrue(forward.is_media)
         self.assertEqual((forward.sender, forward.text), ("wxid_x", ""))
-        self.assertEqual(forward.image_server_id, 500)
+        self.assertEqual(forward.media_server_id, 500)
 
     def test_image_without_a_server_id_is_dropped(self):
         intake, outbox, _ = make_intake(image_limit=3)
@@ -484,6 +642,78 @@ class ImageIntakeTest(unittest.TestCase):
         intake, _, _ = make_intake(user_limit=1, image_limit=5)
         self.assertEqual(intake.accept(image_row()), QUEUED)
         self.assertEqual(intake.accept(row()), USER_RATE_LIMITED)
+
+
+def sticker_row(sender="wxid_x", server_id=600, attributes="", inner="", **overrides):
+    xml = f'<msg><emoji fromusername="{sender}" md5="abc" type="2" {attributes}>{inner}</emoji></msg>'
+    return row(msg_type=STICKER_MESSAGE_TYPE, server_id=server_id, content=f"{sender}:\n{xml}", **overrides)
+
+
+class StickerKindTest(unittest.TestCase):
+    def test_custom_sticker_is_forwardable(self):
+        self.assertIsNone(sticker_kind('<msg><emoji md5="abc" productid="" /></msg>'))
+
+    def test_store_and_game_stickers_are_recognised(self):
+        self.assertEqual(sticker_kind('<msg><emoji productid="com.x" /></msg>'), "store")
+        self.assertEqual(sticker_kind("<msg><emoji><gameext type='2' /></emoji></msg>"), "game")
+
+    def test_unreadable_xml_is_treated_as_forwardable(self):
+        self.assertIsNone(sticker_kind("<msg><emoji"))
+
+    def test_md5_is_read_and_normalised(self):
+        self.assertEqual(sticker_md5('<msg><emoji md5=" ABC123 " /></msg>'), "abc123")
+        self.assertIsNone(sticker_md5('<msg><emoji md5="" /></msg>'))
+        self.assertIsNone(sticker_md5("<msg><emoji"))
+
+
+class StickerIntakeTest(unittest.TestCase):
+    def test_stickers_are_ignored_unless_enabled(self):
+        intake, outbox, _ = make_intake(image_limit=3)
+        self.assertEqual(intake.accept(sticker_row()), IGNORED)
+        self.assertEqual(len(outbox), 0)
+
+    def test_sticker_is_queued_as_media_with_its_server_id(self):
+        intake, outbox, _ = make_intake(sticker_limit=3)
+        self.assertEqual(intake.accept(sticker_row(server_id=600)), QUEUED)
+        forward = outbox.waiting_for(B)[0]
+        self.assertTrue(forward.is_media)
+        self.assertTrue(forward.is_sticker)
+        self.assertEqual((forward.text, forward.media_server_id), ("", 600))
+        self.assertEqual(forward.sticker_md5, "abc")
+
+    def test_sticker_without_a_server_id_is_dropped(self):
+        intake, outbox, _ = make_intake(sticker_limit=3)
+        self.assertEqual(intake.accept(sticker_row(server_id=None)), BAD_STICKER)
+        self.assertEqual(len(outbox), 0)
+
+    def test_store_and_game_stickers_are_skipped(self):
+        intake, outbox, _ = make_intake(sticker_limit=3)
+        store = sticker_row(attributes='productid="com.tencent.xin.emoticon.x"')
+        game = sticker_row(server_id=601, inner='<gameext type="2" content="4" />')
+        self.assertEqual(intake.accept(store), IGNORED)
+        self.assertEqual(intake.accept(game), IGNORED)
+        self.assertEqual(len(outbox), 0)
+
+    def test_sticker_limit_is_separate_from_the_image_limit(self):
+        intake, _, _ = make_intake(image_limit=1, sticker_limit=1)
+        self.assertEqual(intake.accept(image_row(server_id=1)), QUEUED)
+        self.assertEqual(intake.accept(sticker_row(server_id=2)), QUEUED)
+        self.assertEqual(intake.accept(sticker_row(server_id=3)), STICKER_RATE_LIMITED)
+
+    def test_refused_sticker_does_not_use_the_message_quota(self):
+        intake, _, _ = make_intake(user_limit=2, sticker_limit=1)
+        self.assertEqual(intake.accept(sticker_row(server_id=1)), QUEUED)
+        self.assertEqual(intake.accept(sticker_row(server_id=2)), STICKER_RATE_LIMITED)
+        self.assertEqual(intake.accept(row()), QUEUED)
+
+    def test_stickers_keep_their_place_between_messages(self):
+        intake, outbox, _ = make_intake(sticker_limit=3)
+        intake.accept(row(content="wxid_x:\nbefore"))
+        intake.accept(sticker_row(server_id=600))
+        intake.accept(row(content="wxid_x:\nafter"))
+        waiting = outbox.waiting_for(B)
+        self.assertEqual([f.text for f in waiting], ["before", "", "after"])
+        self.assertTrue(waiting[1].is_sticker)
 
 
 class IntakeTest(unittest.TestCase):
@@ -558,14 +788,82 @@ class TimeAdvancingStop:
 
 
 def line(forward):
-    if forward.is_image:
+    if forward.is_media:
         return f"{forward.sender}: [image]"
     return f"{forward.sender}: {forward.text}"
 
 
 def image(sender, server_id, destination=B):
     source = A if destination == B else B
-    return Forward(source, destination, sender, "", image_server_id=server_id)
+    return Forward(source, destination, sender, "", media_server_id=server_id)
+
+
+def quote_xml(text, quoted="the quoted message", subtype="57"):
+    return (
+        '<?xml version="1.0"?>\n<msg>\n\t<appmsg appid="" sdkver="0">\n'
+        f"\t\t<title>{text}</title>\n\t\t<type>{subtype}</type>\n"
+        "\t\t<refermsg>\n\t\t\t<type>1</type>\n"
+        "\t\t\t<fromusr>wxid_other</fromusr>\n\t\t\t<displayname>Bob</displayname>\n"
+        f"\t\t\t<content>{quoted}</content>\n\t\t</refermsg>\n"
+        "\t</appmsg>\n\t<fromusername>wxid_x</fromusername>\n</msg>\n"
+    )
+
+
+class ParseQuoteTextTest(unittest.TestCase):
+    def test_returns_only_the_reply_text(self):
+        self.assertEqual(parse_quote_text(quote_xml("I agree")), "I agree")
+
+    def test_unescapes_xml_entities(self):
+        self.assertEqual(parse_quote_text(quote_xml("a &lt;b&gt; &amp; c")), "a <b> & c")
+
+    def test_rejects_what_is_not_a_quote(self):
+        cases = {
+            "malformed": "<msg><appmsg>",
+            "no refermsg": "<msg><appmsg><title>link</title><type>5</type></appmsg></msg>",
+            "other app message": quote_xml("a file", subtype="6"),
+            "empty text": quote_xml("  "),
+        }
+        for name, xml in cases.items():
+            with self.subTest(name):
+                self.assertIsNone(parse_quote_text(xml))
+
+
+class QuoteIntakeTest(unittest.TestCase):
+    def test_forwards_the_reply_without_the_quoted_message(self):
+        intake, outbox, _ = make_intake()
+        message = row(msg_type=QUOTE_MESSAGE_TYPE, content="wxid_x:\n" + quote_xml("me too"))
+        self.assertEqual(intake.accept(message), QUEUED)
+        self.assertEqual(outbox.waiting_for(B), [Forward(A, B, "wxid_x", "me too")])
+
+    def test_forwards_a_quote_stored_as_an_app_message(self):
+        intake, outbox, _ = make_intake()
+        message = row(msg_type=49, content="wxid_x:\n" + quote_xml("me too"))
+        self.assertEqual(intake.accept(message), QUEUED)
+        self.assertEqual(outbox.waiting_for(B), [Forward(A, B, "wxid_x", "me too")])
+
+    def test_other_app_messages_are_still_ignored(self):
+        intake, outbox, _ = make_intake()
+        link = "wxid_x:\n<msg><appmsg><title>A link</title><type>5</type></appmsg></msg>"
+        self.assertEqual(intake.accept(row(msg_type=49, content=link)), IGNORED)
+        self.assertEqual(len(outbox), 0)
+
+    def test_unreadable_quote_is_skipped_with_a_warning(self):
+        log = RecordingLog()
+        intake, outbox, _ = make_intake(log=log)
+        message = row(msg_type=QUOTE_MESSAGE_TYPE, content="wxid_x:\n<msg><appmsg>")
+        self.assertEqual(intake.accept(message), IGNORED)
+        self.assertEqual(len(outbox), 0)
+        self.assertTrue(any(level == "warning" and "quote" in line for level, line in log.lines))
+
+    def test_blocked_words_apply_to_the_reply_only(self):
+        intake, _, _ = make_intake(blocked=["广告"])
+        blocked = row(msg_type=QUOTE_MESSAGE_TYPE, content="wxid_x:\n" + quote_xml("广告"))
+        self.assertEqual(intake.accept(blocked), BLOCKED)
+        quoting_blocked = row(
+            msg_type=QUOTE_MESSAGE_TYPE,
+            content="wxid_x:\n" + quote_xml("fine", quoted="广告"),
+        )
+        self.assertEqual(intake.accept(quoting_blocked), QUEUED)
 
 
 class CombineReplyTest(unittest.TestCase):
@@ -678,11 +976,11 @@ class RunSenderTest(unittest.TestCase):
             stop.stopped = len(sends) == count
 
         def prepare_image(forward):
-            events.append(f"prepare {forward.image_server_id}")
-            return prepare(forward) if prepare else f"file {forward.image_server_id}"
+            events.append(f"prepare {forward.media_server_id}")
+            return prepare(forward) if prepare else f"file {forward.media_server_id}"
 
         def deliver_image(destination, forward, prepared):
-            deliver(destination, f"<image {forward.image_server_id} from {prepared}>")
+            deliver(destination, f"<image {forward.media_server_id} from {prepared}>")
 
         run_sender(
             outbox, limiter, line, deliver, prepare_image, deliver_image,

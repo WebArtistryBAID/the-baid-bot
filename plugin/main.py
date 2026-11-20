@@ -1,4 +1,4 @@
-"""WeKit plugin that forwards text and image messages between two WeChat group chats."""
+"""WeKit plugin that forwards text, image and sticker messages between two WeChat group chats."""
 
 from __future__ import annotations
 
@@ -17,12 +17,15 @@ from java import dynamic_proxy  # ty: ignore[unresolved-import]
 
 from .relay_core import (
     IMAGE_MESSAGE_TYPE,
+    STICKER_MESSAGE_TYPE,
     Forward,
     Intake,
     MentionReply,
     MessageRow,
     Outbox,
     RateLimiter,
+    UserBlocker,
+    expand_replies,
     load_blocked_words,
     run_sender,
 )
@@ -43,22 +46,55 @@ except ModuleNotFoundError:
     GROUP_A = ""
     GROUP_B = ""
 
-# When someone @mentions the bot, it replies in that group with MENTION_REPLY_FORMAT,
-# filling {person} with a random name. The names may be real people, so they live in
+# When someone @mentions the bot, it replies in both groups with one of these, picked
+# at random (the same one in both). An entry containing {person} counts once per name
+# in MENTION_REPLY_NAMES, so each name is as likely as each other entry. With no
+# entries at all, the bot doesn't reply to mentions.
+MENTION_REPLY_MESSAGES = [
+    "喵喵喵，我猜你是{person}",
+    "你所热爱的，就是你的生活。",
+    "996 是我们这些人修来的福报。",
+    "京东永远不会开除任何一个兄弟。",
+    "先定一个能达到的小目标，比方说我先挣它一个亿。",
+    "原来你也玩原神",
+    "用心创造快乐。",
+    "钱有什么用？我对钱没有兴趣。",
+    "没事，你们就偷偷乐吧",
+    "B 站可能会倒闭，但绝对不会变质。",
+]
+
+# The names for {person}. They may be real people, so they live in
 # plugin/local_config.py too:
 #
 #     MENTION_REPLY_NAMES = ["Name 1", "Name 2"]
 #
-# Without that list, the bot doesn't reply to mentions.
+# Without names, entries containing {person} are left out.
 try:
     from .local_config import MENTION_REPLY_NAMES
 except ImportError:
     MENTION_REPLY_NAMES: list[str] = []
-MENTION_REPLY_FORMAT = "喵喵喵，我猜你是{person}"
+
+# People whose messages are never forwarded, by raw WeChat ID (wxid_…), not by name.
+# The IDs identify real people, so they live in plugin/local_config.py too:
+#
+#     BLOCKED_USERS = ["wxid_abc123"]
+#
+# They also get no mention replies. The list is optional.
+try:
+    from .local_config import BLOCKED_USERS
+except ImportError:
+    BLOCKED_USERS: list[str] = []
+
+# Anyone not on BLOCKED_USERS who sends more than this many messages in an hour, of any
+# type, is blocked for AUTO_BLOCK_HOURS. Messages of theirs that are still waiting are
+# dropped too. Blocks are kept in memory, so they're cleared when the plugin restarts.
+# Set AUTO_BLOCK_MESSAGES_PER_HOUR to None to turn this off.
+AUTO_BLOCK_MESSAGES_PER_HOUR = 100
+AUTO_BLOCK_HOURS = 2
 
 # Each person gets at most one reply per this many seconds. Replies also count toward
 # GLOBAL_MAX_MESSAGES_PER_MINUTE, and are always sent on their own.
-MENTION_REPLY_COOLDOWN_SECONDS = 60
+MENTION_REPLY_COOLDOWN_SECONDS = 30
 
 # Blocked words are private too, so they live in this file next to the plugin, which
 # git ignores. It has one word or phrase per line; blank lines are skipped. Text
@@ -70,11 +106,11 @@ BLOCKED_WORDS_FILE = "blocked_words.txt"
 # The most messages the bot may send per minute, across both groups. Messages over
 # this limit wait in the queue. Because waiting messages are combined, one send can
 # carry many people's messages.
-GLOBAL_MAX_MESSAGES_PER_MINUTE = 20
+GLOBAL_MAX_MESSAGES_PER_MINUTE = 40
 
 # The most messages forwarded per minute for one person, across both groups. Messages
 # over this limit are dropped.
-PER_USER_MAX_MESSAGES_PER_MINUTE = 12
+PER_USER_MAX_MESSAGES_PER_MINUTE = 20
 
 # The most messages that can wait to be sent, counting each original message. New
 # messages are dropped once it is full.
@@ -100,12 +136,12 @@ MAX_SEND_PAUSE_SECONDS = 2.5
 FORWARD_FORMAT = "{name}: {text}"
 
 # Whether to forward images. Each image is its own send and counts toward
-# GLOBAL_MAX_MESSAGES_PER_MINUTE. Stickers, videos and files are never forwarded.
+# GLOBAL_MAX_MESSAGES_PER_MINUTE. Videos and files are never forwarded.
 FORWARD_IMAGES = True
 
 # The most images forwarded per minute for one person, across both groups. Images
 # over this limit are dropped. They also count toward PER_USER_MAX_MESSAGES_PER_MINUTE.
-MAX_IMAGES_PER_USER_PER_MINUTE = 3
+MAX_IMAGES_PER_USER_PER_MINUTE = 5
 
 # The line that credits an image's sender. It ends the text sent just before the
 # image. Available field: {name}.
@@ -121,6 +157,27 @@ IMAGE_SEND_CHECK_SECONDS = 30
 # send failed or didn't finish are kept, so the problem can be looked into.
 DELETE_FORWARDED_IMAGES = True
 DELETE_IMAGES_AFTER_SECONDS = 600
+
+# Whether to forward stickers (表情). Like images, each sticker is its own send, sent
+# straight after a credit line, and counts toward GLOBAL_MAX_MESSAGES_PER_MINUTE.
+# Stickers from the sticker store and dice or rock-paper-scissors games are skipped.
+FORWARD_STICKERS = True
+
+# The most stickers forwarded per minute for one person, across both groups. Stickers
+# over this limit are dropped. They also count toward PER_USER_MAX_MESSAGES_PER_MINUTE.
+MAX_STICKERS_PER_USER_PER_MINUTE = 5
+
+# The line that credits a sticker's sender. Available field: {name}.
+STICKER_CREDIT_FORMAT = "{name}: [表情] ↓"
+
+# To forward a sticker, the bot saves it from WeChat as a normal file in the phone's
+# Download/WeKit folder and uploads that file. WeChat may still be fetching the sticker
+# when its message arrives, so saving is retried for up to this many seconds.
+STICKER_DOWNLOAD_SECONDS = 20
+
+# A saved sticker file is reused while the same sticker keeps being sent, and deleted
+# this many seconds after its latest send, whatever that send's outcome.
+DELETE_STICKERS_AFTER_SECONDS = 600
 
 # -----------------------------------------------------------------------
 
@@ -140,7 +197,9 @@ def _member_name(group: str, wxid: str) -> str:
 def _format_line(forward: Forward) -> str:
     # This runs on the sender thread, so database reads never block WeChat's insert.
     name = _member_name(forward.source_group, forward.sender)
-    if forward.is_image:
+    if forward.is_sticker:
+        return STICKER_CREDIT_FORMAT.format(name=name)
+    if forward.is_media:
         return IMAGE_CREDIT_FORMAT.format(name=name)
     return FORWARD_FORMAT.format(name=name, text=forward.text)
 
@@ -173,16 +232,18 @@ def _latest_message_id() -> int | None:
     return _query_first_value("SELECT MAX(msgId) AS value FROM message")
 
 
-def _wait_for_sent_image(destination: str, after_message_id: int, stop: threading.Event) -> str:
-    """Watches for the bot's next image in the group, returning how the send went.
+def _wait_for_sent_media(
+    destination: str, msg_type: int, after_message_id: int, stop: threading.Event
+) -> str:
+    """Watches for the bot's next image or sticker in the group, returning how it went.
 
-    Returns "sent" or "failed" once WeChat reports either, "missing" if no image
-    appeared at all, or "pending (status N)" if one appeared but hadn't finished.
+    Returns "sent" or "failed" once WeChat reports either, "missing" if nothing
+    appeared at all, or "pending (status N)" if it appeared but hadn't finished.
     """
     talker = destination.replace("'", "''")
     statement = (
         "SELECT status AS value FROM message "
-        f"WHERE talker='{talker}' AND isSend=1 AND type={IMAGE_MESSAGE_TYPE} "
+        f"WHERE talker='{talker}' AND isSend=1 AND type={msg_type} "
         f"AND msgId>{after_message_id} ORDER BY msgId ASC LIMIT 1"
     )
     status = None
@@ -198,7 +259,7 @@ def _wait_for_sent_image(destination: str, after_message_id: int, stop: threadin
     return "missing" if status is None else f"pending (status {status})"
 
 
-def _send_and_check(ctx, destination: str, send, stop: threading.Event) -> str:
+def _send_and_check(ctx, destination: str, msg_type: int, send, stop: threading.Event) -> str:
     """Runs one send, returning its outcome, or "unchecked" if it can't be checked.
 
     A send that returns False was refused by WeKit outright, so there's nothing to wait for.
@@ -207,9 +268,9 @@ def _send_and_check(ctx, destination: str, send, stop: threading.Event) -> str:
     if send() is False:
         return "rejected by WeKit"
     if latest is None:
-        ctx.log.warning("Could not read the latest message ID, so the image send can't be checked")
+        ctx.log.warning("Could not read the latest message ID, so the send can't be checked")
         return "unchecked"
-    return _wait_for_sent_image(destination, latest, stop)
+    return _wait_for_sent_media(destination, msg_type, latest, stop)
 
 
 def _delete_later(ctx, path: str, timers: list[threading.Timer]) -> None:
@@ -228,16 +289,175 @@ def _delete_later(ctx, path: str, timers: list[threading.Timer]) -> None:
     timer.start()
 
 
+class _StickerFiles:
+    """Saved sticker files, kept and reused while the same sticker keeps being sent.
+
+    People often send the same sticker again, so a saved file is found by the sticker's
+    MD5 and sent again rather than saved anew. Each file is deleted
+    DELETE_STICKERS_AFTER_SECONDS after its latest send, and every file is deleted
+    when the plugin stops. A sticker with no MD5 gets a file of its own.
+    """
+
+    def __init__(self, ctx) -> None:
+        self._ctx = ctx
+        self._lock = threading.Lock()
+        # Key (the MD5, or the path when there's none) -> (path, deletion timer). The
+        # timer is None while the file is being sent.
+        self._files: dict[str, tuple[str, threading.Timer | None]] = {}
+
+    @staticmethod
+    def _key(forward: Forward, path: str) -> str:
+        return forward.sticker_md5 or path
+
+    def reuse(self, forward: Forward) -> str | None:
+        """Returns the saved file for this sticker, holding off its deletion until
+        `sent` is called, or None if there's no saved file."""
+        if not forward.sticker_md5:
+            return None
+        with self._lock:
+            entry = self._files.get(forward.sticker_md5)
+            if entry is None:
+                return None
+            path, timer = entry
+            if timer is not None:
+                timer.cancel()
+            if not os.path.exists(path):
+                del self._files[forward.sticker_md5]
+                return None
+            self._files[forward.sticker_md5] = (path, None)
+            return path
+
+    def add(self, forward: Forward, path: str) -> None:
+        """Records a newly saved file, so it's deleted even if it's never sent."""
+        with self._lock:
+            old = self._files.get(self._key(forward, path))
+            if old is not None and old[0] != path:
+                # Another file for the same sticker; this one replaces it.
+                if old[1] is not None:
+                    old[1].cancel()
+                self._remove_file(old[0])
+            self._files[self._key(forward, path)] = (path, None)
+
+    def sent(self, forward: Forward, path: str) -> None:
+        """(Re)starts the countdown to deleting the file, after a send."""
+        key = self._key(forward, path)
+        with self._lock:
+            entry = self._files.get(key)
+            if entry is not None and entry[1] is not None:
+                entry[1].cancel()
+            timer = threading.Timer(DELETE_STICKERS_AFTER_SECONDS, self._expire, (key, path))
+            timer.daemon = True
+            self._files[key] = (path, timer)
+            timer.start()
+
+    def _expire(self, key: str, path: str) -> None:
+        with self._lock:
+            entry = self._files.get(key)
+            # Only the latest countdown for this file deletes it. An older one that was
+            # cancelled too late, or a file that is being sent again, is left alone.
+            if entry is None or entry[0] != path or entry[1] is not threading.current_thread():
+                return
+            del self._files[key]
+            self._remove_file(path)
+
+    def close(self) -> None:
+        with self._lock:
+            for path, timer in self._files.values():
+                if timer is not None:
+                    timer.cancel()
+                self._remove_file(path)
+            self._files.clear()
+
+    def _remove_file(self, path: str) -> None:
+        try:
+            os.remove(path)
+            self._ctx.log.info(f"Deleted forwarded sticker file {os.path.basename(path)}")
+        except FileNotFoundError:
+            pass
+        except OSError:
+            self._ctx.log.exception(f"Could not delete forwarded sticker file {path}")
+
+
+def _download_media(
+    ctx, forward: Forward, stop: threading.Event, stickers: _StickerFiles
+) -> str | None:
+    if forward.is_sticker:
+        return _download_sticker(ctx, forward, stop, stickers)
+    return _download_image(ctx, forward)
+
+
+def _download_sticker(
+    ctx, forward: Forward, stop: threading.Event, stickers: _StickerFiles
+) -> str | None:
+    server_id = forward.media_server_id
+    path = stickers.reuse(forward)
+    if path is not None:
+        ctx.log.info(f"Reusing the saved file for sticker {server_id}")
+        return path
+    # cacheAndSaveSticker looks up the sticker by its message's server ID, decodes
+    # WeChat's local copy into a normal image file, and saves that to Download/WeKit.
+    # It returns None while WeChat hasn't fetched the sticker yet, so keep trying.
+    deadline = time.monotonic() + STICKER_DOWNLOAD_SECONDS
+    while True:
+        path = WeMessageApi.INSTANCE.cacheAndSaveSticker(server_id)
+        if path:
+            stickers.add(forward, str(path))
+            return str(path)
+        if time.monotonic() >= deadline or stop.wait(2):
+            ctx.log.error(f"Could not save sticker {server_id}; skipping it")
+            return None
+
+
 def _download_image(ctx, forward: Forward) -> str | None:
     # WeChat only keeps a thumbnail until an image is opened. downloadImage downloads
     # the image (waiting up to two minutes), converts it from WeChat's own format to a
     # normal image file, and saves that to Download/WeKit. The image's credit line
     # isn't sent until this finishes.
-    path = WeMessageApi.INSTANCE.downloadImage(forward.image_server_id)
+    path = WeMessageApi.INSTANCE.downloadImage(forward.media_server_id)
     if not path:
-        ctx.log.error(f"Could not download image {forward.image_server_id}; skipping it")
+        ctx.log.error(f"Could not download image {forward.media_server_id}; skipping it")
         return None
     return str(path)
+
+
+def _deliver_media(
+    ctx,
+    destination: str,
+    forward: Forward,
+    path: str,
+    stop: threading.Event,
+    timers: list[threading.Timer],
+    stickers: _StickerFiles,
+) -> None:
+    if forward.is_sticker:
+        _deliver_sticker(ctx, destination, forward, path, stop, stickers)
+    else:
+        _deliver_image(ctx, destination, forward, path, stop, timers)
+
+
+def _deliver_sticker(
+    ctx,
+    destination: str,
+    forward: Forward,
+    path: str,
+    stop: threading.Event,
+    stickers: _StickerFiles,
+) -> None:
+    server_id = forward.media_server_id
+    try:
+        outcome = _send_and_check(
+            ctx,
+            destination,
+            STICKER_MESSAGE_TYPE,
+            lambda: WeMessageApi.INSTANCE.sendSticker(destination, path),
+            stop,
+        )
+    finally:
+        # Counted from the latest send whatever happened, so files never pile up.
+        stickers.sent(forward, path)
+    ctx.log.info(f"Sticker {server_id} to {destination}: {outcome}")
+    if outcome not in ("sent", "unchecked") and not outcome.startswith("pending"):
+        ctx.log.error(f"Could not forward sticker {server_id} to {destination}")
 
 
 def _deliver_image(
@@ -248,9 +468,13 @@ def _deliver_image(
     stop: threading.Event,
     timers: list[threading.Timer],
 ) -> None:
-    server_id = forward.image_server_id
+    server_id = forward.media_server_id
     outcome = _send_and_check(
-        ctx, destination, lambda: WeMessageApi.INSTANCE.sendImage(destination, path), stop
+        ctx,
+        destination,
+        IMAGE_MESSAGE_TYPE,
+        lambda: WeMessageApi.INSTANCE.sendImage(destination, path),
+        stop,
     )
     ctx.log.info(f"Image {server_id} to {destination}: {outcome}")
 
@@ -313,21 +537,35 @@ def setup(ctx) -> None:
         ctx.log.info(f"Blocked words: on ({blocked_words.count} loaded)")
 
     mention_reply = None
-    if MENTION_REPLY_NAMES:
-        mention_reply = MentionReply(
-            _own_wechat_id,
-            MENTION_REPLY_FORMAT,
-            MENTION_REPLY_NAMES,
-            MENTION_REPLY_COOLDOWN_SECONDS,
+    replies = expand_replies(MENTION_REPLY_MESSAGES, MENTION_REPLY_NAMES)
+    if replies:
+        mention_reply = MentionReply(_own_wechat_id, replies, MENTION_REPLY_COOLDOWN_SECONDS)
+        ctx.log.info(
+            f"Mention replies: on ({len(replies)} possible replies, "
+            f"{len(MENTION_REPLY_NAMES)} names)"
         )
-        ctx.log.info(f"Mention replies: on ({mention_reply.people_count} names)")
     else:
-        ctx.log.info("Mention replies: off (no MENTION_REPLY_NAMES in local_config.py)")
+        ctx.log.info("Mention replies: off (no possible replies)")
+
+    user_blocker = UserBlocker(
+        BLOCKED_USERS,
+        AUTO_BLOCK_MESSAGES_PER_HOUR,
+        block_seconds=AUTO_BLOCK_HOURS * 3600,
+    )
+    auto_block = (
+        f"over {AUTO_BLOCK_MESSAGES_PER_HOUR} messages an hour blocks for {AUTO_BLOCK_HOURS}h"
+        if AUTO_BLOCK_MESSAGES_PER_HOUR is not None
+        else "automatic blocking off"
+    )
+    ctx.log.info(f"User blocklist: {user_blocker.listed_count} listed; {auto_block}")
 
     stop = threading.Event()
-    # Deletions still waiting when the plugin stops are cancelled, keeping those files.
+    # Image deletions still waiting when the plugin stops are cancelled, keeping those
+    # files. Saved sticker files are all deleted.
     deletion_timers: list[threading.Timer] = []
     ctx.defer(lambda: [timer.cancel() for timer in deletion_timers])
+    stickers = _StickerFiles(ctx)
+    ctx.defer(stickers.close)
     outbox = Outbox(MAX_QUEUED_MESSAGES)
     global_limiter = RateLimiter(GLOBAL_MAX_MESSAGES_PER_MINUTE)
     intake = Intake(
@@ -336,8 +574,12 @@ def setup(ctx) -> None:
         outbox,
         MAX_MESSAGE_AGE_SECONDS,
         image_limiter=RateLimiter(MAX_IMAGES_PER_USER_PER_MINUTE) if FORWARD_IMAGES else None,
+        sticker_limiter=(
+            RateLimiter(MAX_STICKERS_PER_USER_PER_MINUTE) if FORWARD_STICKERS else None
+        ),
         blocked_words=blocked_words,
         mention_reply=mention_reply,
+        user_blocker=user_blocker,
         log=ctx.log,
     )
     discovered_groups: set[str] = set()
@@ -381,9 +623,9 @@ def setup(ctx) -> None:
             global_limiter,
             _format_line,
             lambda destination, text: _deliver(ctx, destination, text),
-            lambda forward: _download_image(ctx, forward),
-            lambda destination, forward, path: _deliver_image(
-                ctx, destination, forward, path, stop, deletion_timers
+            lambda forward: _download_media(ctx, forward, stop, stickers),
+            lambda destination, forward, path: _deliver_media(
+                ctx, destination, forward, path, stop, deletion_timers, stickers
             ),
             stop,
             COMBINE_WAIT_SECONDS,

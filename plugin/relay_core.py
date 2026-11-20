@@ -11,9 +11,18 @@ from collections import deque
 from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from xml.etree import ElementTree
 
 TEXT_MESSAGE_TYPE = 1
 IMAGE_MESSAGE_TYPE = 3
+STICKER_MESSAGE_TYPE = 47
+# A message that quotes another one. Its content is XML: the reply's own text is in
+# <appmsg><title>, and the quoted message is in <appmsg><refermsg>.
+QUOTE_MESSAGE_TYPE = 822083633
+# Some WeChat versions store a quote as a general app message (links, files and so on)
+# whose <appmsg><type> is 57.
+APP_MESSAGE_TYPE = 49
+QUOTE_APP_MESSAGE_SUBTYPE = "57"
 
 # Results returned by Intake.accept.
 QUEUED = "queued"
@@ -21,9 +30,12 @@ IGNORED = "ignored"
 DUPLICATE = "duplicate"
 STALE = "stale"
 BAD_IMAGE = "bad_image"
+BAD_STICKER = "bad_sticker"
 BLOCKED = "blocked"
+BLOCKED_USER = "blocked_user"
 ANNOUNCEMENT = "announcement"
 IMAGE_RATE_LIMITED = "image_rate_limited"
+STICKER_RATE_LIMITED = "sticker_rate_limited"
 USER_RATE_LIMITED = "user_rate_limited"
 QUEUE_FULL = "queue_full"
 
@@ -111,20 +123,29 @@ class MessageRow:
 
 @dataclass(frozen=True)
 class Forward:
-    """A message waiting to be sent. For an image, `text` is empty."""
+    """A message waiting to be sent.
+
+    An image or sticker ("media") has its server ID in `media_server_id` and an empty
+    `text`. Media is sent on its own, straight after a credit line naming its sender.
+    """
 
     source_group: str
     destination_group: str
     sender: str
     text: str
-    image_server_id: int | None = None
+    media_server_id: int | None = None
     # A reply from the bot itself, sent as its own message rather than forwarded. For a
     # reply, `text` is the whole message and both groups are the group it goes to.
     is_reply: bool = False
+    # For media: a sticker rather than an image.
+    is_sticker: bool = False
+    # A sticker's MD5, which is the same every time anyone sends that sticker. None
+    # when it couldn't be read.
+    sticker_md5: str | None = None
 
     @property
-    def is_image(self) -> bool:
-        return self.image_server_id is not None
+    def is_media(self) -> bool:
+        return self.media_server_id is not None
 
 
 _AT_USER_LIST = re.compile(
@@ -158,6 +179,62 @@ def parse_group_content(content: str | None) -> tuple[str, str] | None:
     if not separator or not sender or not text:
         return None
     return sender, text
+
+
+# A sticker that can't be forwarded: one from the sticker store, or a dice or
+# rock-paper-scissors game whose result is random.
+STORE_STICKER = "store"
+GAME_STICKER = "game"
+
+
+def sticker_kind(xml: str) -> str | None:
+    """Returns STORE_STICKER or GAME_STICKER for stickers that aren't forwarded, else None.
+
+    A sticker whose XML can't be read is treated as forwardable, since downloading it
+    only needs its server ID.
+    """
+    try:
+        root = ElementTree.fromstring(xml.strip())
+    except ElementTree.ParseError:
+        return None
+    emoji = root if root.tag == "emoji" else root.find("emoji")
+    if emoji is None:
+        return None
+    if root.find(".//gameext") is not None or (emoji.get("gameext") or "").strip():
+        return GAME_STICKER
+    if (emoji.get("productid") or "").strip():
+        return STORE_STICKER
+    return None
+
+
+def sticker_md5(xml: str) -> str | None:
+    """Returns a sticker's MD5 from its XML, or None if it can't be read."""
+    try:
+        root = ElementTree.fromstring(xml.strip())
+    except ElementTree.ParseError:
+        return None
+    emoji = root if root.tag == "emoji" else root.find("emoji")
+    md5 = (emoji.get("md5") or "").strip().lower() if emoji is not None else ""
+    return md5 or None
+
+
+def parse_quote_text(xml: str) -> str | None:
+    """Returns the reply's own text from a quote message, leaving out what it quotes.
+
+    Returns None when the XML can't be read, isn't a quote, or has no text.
+    """
+    try:
+        root = ElementTree.fromstring(xml.strip())
+    except ElementTree.ParseError:
+        return None
+    appmsg = root if root.tag == "appmsg" else root.find("appmsg")
+    if appmsg is None or appmsg.find("refermsg") is None:
+        return None
+    subtype = (appmsg.findtext("type") or "").strip()
+    if subtype and subtype != QUOTE_APP_MESSAGE_SUBTYPE:
+        return None
+    text = (appmsg.findtext("title") or "").strip()
+    return text or None
 
 
 class Outbox:
@@ -202,6 +279,14 @@ class Outbox:
         removed = {id(forward) for forward in forwards}
         with self._condition:
             self._forwards = deque(f for f in self._forwards if id(f) not in removed)
+
+    def drop_sender(self, sender: str) -> int:
+        """Removes everything waiting from one sender, returning how many were removed."""
+        with self._condition:
+            kept = deque(f for f in self._forwards if f.sender != sender)
+            dropped = len(self._forwards) - len(kept)
+            self._forwards = kept
+            return dropped
 
 
 def normalise_for_matching(text: str) -> str:
@@ -283,12 +368,29 @@ def load_blocked_words(path: Path) -> BlockedWords | None:
     return BlockedWords(text.splitlines())
 
 
+def expand_replies(templates: Sequence[str], people: Sequence[str]) -> list[str]:
+    """Turns reply templates into the full list of possible replies.
+
+    A template containing {person} becomes one reply per person; with no people, it's
+    left out. Other templates are used as they are.
+    """
+    if isinstance(people, str):
+        people = [people]
+    names = [person.strip() for person in people if person.strip()]
+    replies: list[str] = []
+    for template in templates:
+        if "{person}" in template:
+            replies.extend(template.replace("{person}", name) for name in names)
+        elif template.strip():
+            replies.append(template)
+    return replies
+
+
 class MentionReply:
     """Decides the bot's reply when someone @mentions it.
 
-    The reply is `reply_format` with {person} filled in by a random entry from `people`.
-    Each sender gets at most one reply per `cooldown_seconds`, so mentions can't be used
-    to make the bot spam the group.
+    The reply is picked at random from `replies`. Each sender gets at most one reply per
+    `cooldown_seconds`, so mentions can't be used to make the bot spam the groups.
     """
 
     COOLING_DOWN = object()
@@ -296,25 +398,21 @@ class MentionReply:
     def __init__(
         self,
         own_id: Callable[[], str | None],
-        reply_format: str,
-        people: Sequence[str],
+        replies: Sequence[str],
         cooldown_seconds: float,
         choose: Callable[[Sequence[str]], str] = random.choice,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if isinstance(people, str):
-            people = [people]
-        self._people = [person.strip() for person in people if person.strip()]
-        if not self._people:
-            raise ValueError("a mention reply needs at least one name")
+        self._replies = list(replies)
+        if not self._replies:
+            raise ValueError("a mention reply needs at least one possible reply")
         self._own_id = own_id
-        self._reply_format = reply_format
         self._choose = choose
         self._cooldown = RateLimiter(1, window_seconds=cooldown_seconds, clock=clock)
 
     @property
-    def people_count(self) -> int:
-        return len(self._people)
+    def reply_count(self) -> int:
+        return len(self._replies)
 
     def reply_to(self, sender: str, msg_source: bytes | None):
         """The reply text, COOLING_DOWN, or None if the message doesn't mention the bot."""
@@ -323,7 +421,82 @@ class MentionReply:
             return None
         if not self._cooldown.try_acquire(sender):
             return MentionReply.COOLING_DOWN
-        return self._reply_format.format(person=self._choose(self._people))
+        return self._choose(self._replies)
+
+
+class UserBlocker:
+    """Decides whose messages are never forwarded.
+
+    People in `listed` are always blocked. Anyone else who sends more than
+    `max_messages` within `window_seconds` is blocked for `block_seconds`, counted from
+    the message that went over the limit. Every message counts, whatever its type and
+    whether or not it was forwarded. Set `max_messages` to None to turn this off.
+    """
+
+    LISTED = "listed"
+    STARTED = "started"
+    ONGOING = "ongoing"
+    ENDED = "ended"
+
+    def __init__(
+        self,
+        listed: Iterable[str],
+        max_messages: int | None,
+        window_seconds: float = 3600,
+        block_seconds: float = 7200,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if isinstance(listed, str):
+            listed = [listed]
+        self._listed = {wxid.strip() for wxid in listed if wxid.strip()}
+        self._max_messages = max_messages
+        self._window = window_seconds
+        self._block = block_seconds
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._sent: dict[str, deque[float]] = {}
+        self._blocked_until: dict[str, float] = {}
+
+    @property
+    def listed_count(self) -> int:
+        return len(self._listed)
+
+    def _prune(self, now: float) -> None:
+        for sender, times in list(self._sent.items()):
+            while times and now - times[0] >= self._window:
+                times.popleft()
+            if not times:
+                del self._sent[sender]
+
+    def check(self, sender: str) -> str | None:
+        """Records a message from `sender` and returns their block status.
+
+        Returns LISTED, STARTED (this message put them over the limit), ONGOING, ENDED
+        (an earlier block has just run out, and this message isn't blocked), or None.
+        """
+        if sender in self._listed:
+            return self.LISTED
+        if self._max_messages is None:
+            return None
+        with self._lock:
+            now = self._clock()
+            self._prune(now)
+            times = self._sent.setdefault(sender, deque())
+            times.append(now)
+
+            until = self._blocked_until.get(sender)
+            if until is not None:
+                if now < until:
+                    return self.ONGOING
+                del self._blocked_until[sender]
+                ended = True
+            else:
+                ended = False
+
+            if len(times) > self._max_messages:
+                self._blocked_until[sender] = now + self._block
+                return self.STARTED
+            return self.ENDED if ended else None
 
 
 class Intake:
@@ -337,22 +510,27 @@ class Intake:
         max_age_seconds: float,
         *,
         image_limiter: RateLimiter | None = None,
+        sticker_limiter: RateLimiter | None = None,
         blocked_words: BlockedWords | None = None,
         mention_reply: MentionReply | None = None,
+        user_blocker: UserBlocker | None = None,
         log: object | None = None,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
-        """Images are forwarded only when `image_limiter` is given.
+        """Images are forwarded only when `image_limiter` is given, and stickers only
+        when `sticker_limiter` is given.
 
         `log` receives a line for each decision about a message from one of the two
         groups. Lines name the sender's WeChat ID and the group, never the message text.
         """
         self._routes = routes
         self._mention_reply = mention_reply
+        self._user_blocker = user_blocker
         self._log = log or SilentLog()
         self._blocked_words = blocked_words or BlockedWords([])
         self._user_limiter = user_limiter
         self._image_limiter = image_limiter
+        self._sticker_limiter = sticker_limiter
         self._outbox = outbox
         self._max_age_seconds = max_age_seconds
         self._wall_clock = wall_clock
@@ -360,11 +538,13 @@ class Intake:
 
     def accept(self, row: MessageRow) -> str:
         destination = self._routes.get(row.talker or "")
-        accepted_types = {TEXT_MESSAGE_TYPE}
+        accepted_types = {TEXT_MESSAGE_TYPE, QUOTE_MESSAGE_TYPE, APP_MESSAGE_TYPE}
         if self._image_limiter is not None:
             accepted_types.add(IMAGE_MESSAGE_TYPE)
+        if self._sticker_limiter is not None:
+            accepted_types.add(STICKER_MESSAGE_TYPE)
         # is_send == 1 covers the relay's own forwards, which is what prevents a loop.
-        if destination is None or row.is_send == 1 or row.msg_type not in accepted_types:
+        if destination is None or row.is_send == 1:
             return IGNORED
 
         parsed = parse_group_content(row.content)
@@ -372,9 +552,30 @@ class Intake:
             return IGNORED
         sender, text = parsed
         group = row.talker
+
+        # Checked before the message type, so stickers and other messages that are never
+        # forwarded still count toward the automatic block.
+        if self._user_blocker is not None and self._is_blocked(sender, group):
+            return BLOCKED_USER
+
+        if row.msg_type not in accepted_types:
+            return IGNORED
+        # A quote is forwarded as plain text: just the reply, without the quoted message.
+        # Other app messages (links, files, mini programs) are not forwarded.
+        if row.msg_type in (QUOTE_MESSAGE_TYPE, APP_MESSAGE_TYPE):
+            quote_text = parse_quote_text(text)
+            if quote_text is None:
+                if row.msg_type == QUOTE_MESSAGE_TYPE:
+                    self._log.warning(
+                        f"Skipped a quote from {sender} in {group}: could not read its text"
+                    )
+                return IGNORED
+            text = quote_text
         is_image = row.msg_type == IMAGE_MESSAGE_TYPE
-        kind = "image" if is_image else "message"
-        a_kind = "an image" if is_image else "a message"
+        is_sticker = row.msg_type == STICKER_MESSAGE_TYPE
+        is_media = is_image or is_sticker
+        kind = "image" if is_image else "sticker" if is_sticker else "message"
+        a_kind = f"an {kind}" if is_image else f"a {kind}"
         source = f"from {sender} in {group}"
 
         # Checked before the rate limits, so an announcement doesn't use up any quota.
@@ -382,11 +583,18 @@ class Intake:
             self._log.info(f"Skipped a group announcement {source}")
             return ANNOUNCEMENT
 
-        if is_image:
-            # The server ID is how the sender later asks WeKit for the image.
+        md5 = None
+        if is_sticker:
+            md5 = sticker_md5(text)
+            unsupported = sticker_kind(text)
+            if unsupported is not None:
+                self._log.info(f"Skipped a {unsupported} sticker {source}: can't be forwarded")
+                return IGNORED
+        if is_media:
+            # The server ID is how the sender later asks WeKit for the file.
             if not row.server_id:
-                self._log.warning(f"Skipped an image {source}: it has no server ID")
-                return BAD_IMAGE
+                self._log.warning(f"Skipped {a_kind} {source}: it has no server ID")
+                return BAD_IMAGE if is_image else BAD_STICKER
             text = ""
         # Checked before the rate limits, so a blocked message doesn't use up any quota.
         elif self._blocked_words.matches(text):
@@ -408,29 +616,34 @@ class Intake:
                 )
                 return STALE
 
-        # Check the image limit first without using it, so a refused image doesn't use up
-        # the sender's general quota.
-        if is_image and self._image_limiter.seconds_until_available(sender) > 0:
+        # Check the image or sticker limit first without using it, so refused media
+        # doesn't use up the sender's general quota.
+        media_limiter = (
+            self._image_limiter if is_image else self._sticker_limiter if is_sticker else None
+        )
+        if media_limiter is not None and media_limiter.seconds_until_available(sender) > 0:
             self._log.warning(
-                f"Image limit reached for {sender} ({self._image_limiter.describe()}); "
-                f"dropped their image in {group}"
+                f"{kind.capitalize()} limit reached for {sender} ({media_limiter.describe()}); "
+                f"dropped their {kind} in {group}"
             )
-            return IMAGE_RATE_LIMITED
+            return IMAGE_RATE_LIMITED if is_image else STICKER_RATE_LIMITED
         if not self._user_limiter.try_acquire(sender):
             self._log.warning(
                 f"Message limit reached for {sender} ({self._user_limiter.describe()}); "
                 f"dropped their {kind} in {group}"
             )
             return USER_RATE_LIMITED
-        if is_image:
-            self._image_limiter.try_acquire(sender)
+        if media_limiter is not None:
+            media_limiter.try_acquire(sender)
 
         forward = Forward(
             row.talker,
             destination,
             sender,
             text,
-            image_server_id=row.server_id if is_image else None,
+            media_server_id=row.server_id if is_media else None,
+            is_sticker=is_sticker,
+            sticker_md5=md5,
         )
         if not self._outbox.put(forward):
             self._log.warning(
@@ -444,6 +657,25 @@ class Intake:
             self._queue_mention_reply(row, sender, group)
         return QUEUED
 
+    def _is_blocked(self, sender: str, group: str) -> bool:
+        status = self._user_blocker.check(sender)
+        if status == UserBlocker.LISTED:
+            self._log.debug(f"Skipped a message from {sender} in {group}: on the blocklist")
+            return True
+        if status == UserBlocker.STARTED:
+            dropped = self._outbox.drop_sender(sender)
+            self._log.warning(
+                f"Blocked {sender} for sending too many messages (last seen in {group}); "
+                f"dropped {_plural(dropped, 'waiting message')}"
+            )
+            return True
+        if status == UserBlocker.ONGOING:
+            self._log.debug(f"Skipped a message from {sender} in {group}: temporarily blocked")
+            return True
+        if status == UserBlocker.ENDED:
+            self._log.info(f"Temporary block on {sender} has ended")
+        return False
+
     def _queue_mention_reply(self, row: MessageRow, sender: str, group: str) -> None:
         reply = self._mention_reply.reply_to(sender, row.msg_source)
         if reply is None:
@@ -451,10 +683,21 @@ class Intake:
         if reply == MentionReply.COOLING_DOWN:
             self._log.info(f"Not replying to a mention from {sender} in {group}: on cooldown")
             return
-        if not self._outbox.put(Forward(group, group, sender, reply, is_reply=True)):
-            self._log.warning(f"Queue full; not replying to a mention from {sender} in {group}")
-            return
-        self._log.info(f"Queued a mention reply to {sender} in {group}")
+        # The reply goes to every relay group, starting with the one the mention was in.
+        targets = [group, *(other for other in self._routes if other != group)]
+        queued = []
+        for target in targets:
+            if self._outbox.put(Forward(group, target, sender, reply, is_reply=True)):
+                queued.append(target)
+            else:
+                self._log.warning(
+                    f"Queue full; not sending the mention reply for {sender} to {target}"
+                )
+        if queued:
+            self._log.info(
+                f"Queued a mention reply to {sender} (mentioned in {group}) "
+                f"for {' and '.join(queued)}"
+            )
 
 
 def combine(
@@ -465,11 +708,12 @@ def combine(
 ) -> tuple[str, list[Forward], Forward | None, str | None]:
     """Joins messages into one, one line each, stopping before it gets too long.
 
-    An image can't be part of the text, so combining stops at the first image. Its
-    line (the credit, such as "Alice: [图片]") is returned separately from the text,
-    so the caller can add it only once the image is ready to send.
+    An image or sticker can't be part of the text, so combining stops at the first
+    one. Its line (the credit, such as "Alice: [图片]") is returned separately from the
+    text, so the caller can add it only once the file is ready to send.
 
-    Returns the combined text, the messages it used up, and the next image with its
+    Returns the combined text, the messages it used up, and the next image or sticker
+    with its
     credit line (or None for both). The first message is always used, even if it is
     longer than the limit. A message that can't be formatted is reported and used up,
     so it can't block the ones behind it.
@@ -493,7 +737,7 @@ def combine(
         if lines and length + added > max_characters:
             break
         used.append(forward)
-        if forward.is_image:
+        if forward.is_media:
             return "\n".join(lines), used, forward, line
         lines.append(line)
         length += added
@@ -526,8 +770,8 @@ def run_sender(
     global_limiter: RateLimiter,
     format_line: Callable[[Forward], str],
     deliver: Callable[[str, str], object],
-    prepare_image: Callable[[Forward], object | None],
-    deliver_image: Callable[[str, Forward, object], object],
+    prepare_media: Callable[[Forward], object | None],
+    deliver_media: Callable[[str, Forward, object], object],
     stop: threading.Event,
     collect_seconds: float,
     max_characters: int,
@@ -540,9 +784,9 @@ def run_sender(
     After the first message arrives, it waits `collect_seconds` so more can join it.
     While the global limit holds a send back, new messages keep joining it too.
 
-    An image is first prepared with `prepare_image`, which downloads it and returns
-    what `deliver_image` needs, or None if it failed. Only then is its credit line
-    added to the text. A failed image is dropped along with its credit line. The image
+    An image or sticker is first prepared with `prepare_media`, which downloads it and
+    returns what `deliver_media` needs, or None if it failed. Only then is its credit
+    line added to the text. A failed one is dropped along with its credit line. The file
     itself is its own send, made straight after the text, and it counts toward the
     global limit like any other send.
 
@@ -566,19 +810,19 @@ def run_sender(
         if not go:
             return
 
-        text, used, image, credit = combine(
+        text, used, media, credit = combine(
             outbox.waiting_for(destination), format_line, max_characters, on_error
         )
         outbox.remove(used)
 
         prepared = None
-        if image is not None:
+        if media is not None:
             try:
-                prepared = prepare_image(image)
-            except Exception as error:  # noqa: BLE001 - one bad image must not stop the relay
+                prepared = prepare_media(media)
+            except Exception as error:  # noqa: BLE001 - one bad file must not stop the relay
                 on_error(error)
             if prepared is None:
-                image = None
+                media = None
             else:
                 text = f"{text}\n{credit}" if text else credit
 
@@ -588,25 +832,25 @@ def run_sender(
             except Exception as error:  # noqa: BLE001 - one failed send must not stop the relay
                 on_error(error)
             else:
-                count = sum(1 for f in used if not f.is_image and not f.is_reply)
+                count = sum(1 for f in used if not f.is_media and not f.is_reply)
                 parts = [_plural(count, "message")] if count else []
                 if any(f.is_reply for f in used):
                     parts.append("a mention reply")
-                if image is not None:
-                    parts.append("an image credit")
+                if media is not None:
+                    parts.append("a sticker credit" if media.is_sticker else "an image credit")
                 after_wait = " after waiting for the global limit" if waited else ""
                 log.info(
                     f"Sent {' and '.join(parts)} to {destination} in one send "
                     f"({len(text)} characters){after_wait}; "
                     f"{_plural(len(outbox), 'message')} still queued"
                 )
-        if image is not None:
+        if media is not None:
             stop.wait(pause_seconds())
             go, _ = _acquire(global_limiter, stop, on_wait)
             if not go:
                 return
             try:
-                deliver_image(destination, image, prepared)
+                deliver_media(destination, media, prepared)
             except Exception as error:  # noqa: BLE001 - one failed send must not stop the relay
                 on_error(error)
         stop.wait(pause_seconds())

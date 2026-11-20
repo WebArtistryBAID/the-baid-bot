@@ -40,6 +40,9 @@ class FakeRows(list):
     def get(self, index):
         return self[index]
 
+    def size(self):
+        return len(self)
+
 
 class FakeDatabase:
     def __init__(self):
@@ -49,8 +52,8 @@ class FakeDatabase:
         # lvbuffer values by msgSvrId, for rows whose insert didn't include it.
         self.stored_msg_sources = {}
 
-    def add_sent_image(self, talker, status):
-        self.messages.append((self.messages[-1][0] + 1, talker, 1, 3, status))
+    def add_sent_image(self, talker, status, message_type=3):
+        self.messages.append((self.messages[-1][0] + 1, talker, 1, message_type, status))
 
     def executeQuery(self, statement, args):
         if "MAX(msgId)" in statement:
@@ -62,8 +65,9 @@ class FakeDatabase:
             return FakeRows([{"value": self.stored_msg_sources[server_id]}])
         talker = re.search(r"talker='([^']*)'", statement).group(1)
         after = int(re.search(r"msgId>(\d+)", statement).group(1))
+        wanted_type = int(re.search(r"type=(\d+)", statement).group(1))
         for message_id, row_talker, is_send, message_type, status in self.messages:
-            if (row_talker, is_send, message_type) == (talker, 1, 3) and message_id > after:
+            if (row_talker, is_send, message_type) == (talker, 1, wanted_type) and message_id > after:
                 return FakeRows([{"value": status}])
         return FakeRows()
 
@@ -139,6 +143,11 @@ def image_message(talker=A, sender="wxid_nick", server_id=500):
     return message(talker=talker, type=3, msgSvrId=server_id, content=f"{sender}:\n{xml}")
 
 
+def sticker_message(talker=A, sender="wxid_nick", server_id=600, attributes="", md5="abc123"):
+    xml = f'<msg><emoji fromusername="{sender}" md5="{md5}" type="2" {attributes}/></msg>'
+    return message(talker=talker, type=47, msgSvrId=server_id, content=f"{sender}:\n{xml}")
+
+
 class PluginMainTest(unittest.TestCase):
     def setUp(self):
         self.sent = []
@@ -161,6 +170,8 @@ class PluginMainTest(unittest.TestCase):
                 sendText=self.send_text,
                 sendImage=self.send_image_file,
                 downloadImage=self.download_image,
+                sendSticker=self.send_sticker_file,
+                cacheAndSaveSticker=self.save_sticker,
             )
         )
         java = types.ModuleType("java")
@@ -183,12 +194,18 @@ class PluginMainTest(unittest.TestCase):
         self.main = importlib.import_module(".main", NAMESPACE)
         self.main.MIN_SEND_PAUSE_SECONDS = 0
         self.main.MAX_SEND_PAUSE_SECONDS = 0
-        # Tests choose their own names, rather than whatever local_config.py has.
+        # Tests choose who's blocked, rather than the real local_config.py.
+        self.main.BLOCKED_USERS = []
+        # Tests choose their own names and replies, rather than the real settings.
+        self.default_replies = list(self.main.MENTION_REPLY_MESSAGES)
         self.main.MENTION_REPLY_NAMES = []
+        self.main.MENTION_REPLY_MESSAGES = ["喵喵喵，我猜你是{person}"]
         # Long enough for a test's messages to arrive before the first send.
         self.main.COMBINE_WAIT_SECONDS = 0.3
         self.main.IMAGE_SEND_CHECK_SECONDS = 1
         self.main.DELETE_IMAGES_AFTER_SECONDS = 0.05
+        self.main.DELETE_STICKERS_AFTER_SECONDS = 0.05
+        self.main.STICKER_DOWNLOAD_SECONDS = 0
 
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -203,6 +220,10 @@ class PluginMainTest(unittest.TestCase):
         self.upload_status = 2
         self.upload_accepted = True
         self.uploads = []
+        self.sticker_file = Path(directory.name) / "Download" / "WeKit" / "sticker_1.gif"
+        self.sticker_file.write_bytes(b"sticker bytes")
+        # What each cacheAndSaveSticker call returns, in turn; the last one repeats.
+        self.sticker_results = [str(self.sticker_file)]
 
     def send_text(self, destination, text):
         self.events.append(f"text {text}")
@@ -216,6 +237,166 @@ class PluginMainTest(unittest.TestCase):
         if self.upload_accepted and self.upload_status is not None:
             self.database.add_sent_image(destination, self.upload_status)
         return self.upload_accepted
+
+    def send_sticker_file(self, destination, path):
+        self.events.append(f"sticker {path}")
+        self.uploads.append((destination, path))
+        self.sent.append((destination, f"<sticker {Path(path).name}>"))
+        if self.upload_accepted and self.upload_status is not None:
+            self.database.add_sent_image(destination, self.upload_status, message_type=47)
+        return self.upload_accepted
+
+    def save_sticker(self, server_id):
+        self.events.append(f"save sticker {server_id}")
+        if len(self.sticker_results) > 1:
+            return self.sticker_results.pop(0)
+        return self.sticker_results[0]
+
+    def sticker_log(self, context, outcome, server_id=600, destination=B):
+        line = f"Sticker {server_id} to {destination}: {outcome}"
+        return wait_until(lambda: line in context.log.lines)
+
+    def test_sticker_is_saved_then_credited_then_sent_in_order(self):
+        context, listener = self.start()
+        listener.onInsert("message", message(text="before"))
+        listener.onInsert("message", sticker_message(server_id=600))
+        listener.onInsert("message", message(text="after"))
+
+        self.assertTrue(self.sticker_log(context, "sent"))
+        self.assertTrue(wait_until(lambda: len(self.events) == 4))
+        self.assertEqual(
+            self.events,
+            [
+                "save sticker 600",
+                "text Group Nick: before\nGroup Nick: [表情] ↓",
+                f"sticker {self.sticker_file}",
+                "text Group Nick: after",
+            ],
+        )
+
+    def test_sticker_file_is_deleted_after_sending(self):
+        context, listener = self.start()
+        listener.onInsert("message", sticker_message())
+
+        self.assertTrue(self.sticker_log(context, "sent"))
+        self.assertTrue(wait_until(lambda: not self.sticker_file.exists()))
+        self.assertIn("Deleted forwarded sticker file sticker_1.gif", context.log.lines)
+
+    def test_same_sticker_reuses_its_saved_file(self):
+        self.main.DELETE_STICKERS_AFTER_SECONDS = 60
+        context, listener = self.start()
+        listener.onInsert("message", sticker_message(server_id=600))
+        self.assertTrue(self.sticker_log(context, "sent", server_id=600))
+        listener.onInsert("message", sticker_message(talker=B, server_id=601))
+
+        self.assertTrue(self.sticker_log(context, "sent", server_id=601, destination=A))
+        self.assertEqual(self.events.count("save sticker 600"), 1)
+        self.assertNotIn("save sticker 601", self.events)
+        self.assertEqual(self.uploads, [(B, str(self.sticker_file)), (A, str(self.sticker_file))])
+        self.assertIn("Reusing the saved file for sticker 601", context.log.lines)
+
+    def test_sticker_file_is_deleted_only_after_its_latest_send(self):
+        self.main.DELETE_STICKERS_AFTER_SECONDS = 1.5
+        context, listener = self.start()
+        listener.onInsert("message", sticker_message(server_id=600))
+        self.assertTrue(self.sticker_log(context, "sent", server_id=600))
+        first_sent = time.monotonic()
+        time.sleep(0.4)
+        listener.onInsert("message", sticker_message(server_id=601))
+        self.assertTrue(self.sticker_log(context, "sent", server_id=601))
+        self.assertNotIn("save sticker 601", self.events)
+
+        # Past the first send's countdown, but not the second's.
+        time.sleep(max(0.0, first_sent + 1.7 - time.monotonic()))
+        self.assertTrue(self.sticker_file.exists())
+        self.assertTrue(wait_until(lambda: not self.sticker_file.exists()))
+
+    def test_different_stickers_get_their_own_files(self):
+        other_file = self.sticker_file.with_name("sticker_2.gif")
+        other_file.write_bytes(b"other sticker")
+        self.sticker_results = [str(self.sticker_file), str(other_file)]
+        context, listener = self.start()
+        listener.onInsert("message", sticker_message(server_id=600, md5="aaa"))
+        self.assertTrue(self.sticker_log(context, "sent", server_id=600))
+        listener.onInsert("message", sticker_message(server_id=601, md5="bbb"))
+
+        self.assertTrue(self.sticker_log(context, "sent", server_id=601))
+        self.assertEqual(self.uploads, [(B, str(self.sticker_file)), (B, str(other_file))])
+
+    def test_deleted_sticker_file_is_saved_again(self):
+        self.main.DELETE_STICKERS_AFTER_SECONDS = 0.05
+        context, listener = self.start()
+        listener.onInsert("message", sticker_message(server_id=600))
+        self.assertTrue(self.sticker_log(context, "sent", server_id=600))
+        self.assertTrue(wait_until(lambda: not self.sticker_file.exists()))
+        self.sticker_file.write_bytes(b"sticker bytes")
+        listener.onInsert("message", sticker_message(server_id=601))
+
+        self.assertTrue(self.sticker_log(context, "sent", server_id=601))
+        self.assertIn("save sticker 601", self.events)
+
+    def test_sticker_file_is_deleted_even_when_the_send_fails(self):
+        self.upload_status = 5
+        context, listener = self.start()
+        listener.onInsert("message", sticker_message())
+
+        self.assertTrue(self.sticker_log(context, "failed"))
+        self.assertTrue(wait_until(lambda: not self.sticker_file.exists()))
+        self.assertIn(f"Could not forward sticker 600 to {B}", context.log.lines)
+
+    def test_stopping_deletes_waiting_sticker_files(self):
+        self.main.DELETE_STICKERS_AFTER_SECONDS = 60
+        context, listener = self.start()
+        listener.onInsert("message", sticker_message())
+
+        self.assertTrue(self.sticker_log(context, "sent"))
+        self.assertTrue(self.sticker_file.exists())
+        context.close()
+        context.cleanup.clear()
+        self.assertFalse(self.sticker_file.exists())
+
+    def test_sticker_save_is_retried_until_wechat_has_it(self):
+        self.main.STICKER_DOWNLOAD_SECONDS = 10
+        self.sticker_results = [None, str(self.sticker_file)]
+        context, listener = self.start()
+        listener.onInsert("message", sticker_message())
+
+        self.assertTrue(self.sticker_log(context, "sent"))
+        self.assertEqual(self.events.count("save sticker 600"), 2)
+
+    def test_sticker_that_cannot_be_saved_is_skipped_with_its_credit(self):
+        self.sticker_results = [None]
+        context, listener = self.start()
+        listener.onInsert("message", message(text="look"))
+        listener.onInsert("message", sticker_message())
+
+        expected = "Could not save sticker 600; skipping it"
+        self.assertTrue(wait_until(lambda: expected in context.log.lines))
+        self.assertTrue(wait_until(lambda: self.sent))
+        time.sleep(0.1)
+        self.assertEqual(self.sent, [(B, "Group Nick: look")])
+
+    def test_store_stickers_are_not_forwarded(self):
+        _, listener = self.start()
+        listener.onInsert(
+            "message", sticker_message(attributes='productid="com.tencent.xin.emoticon.x"')
+        )
+        listener.onInsert("message", message(text="hi"))
+
+        self.assertTrue(wait_until(lambda: self.sent))
+        time.sleep(0.1)
+        self.assertEqual(self.sent, [(B, "Group Nick: hi")])
+        self.assertNotIn("save sticker 600", self.events)
+
+    def test_stickers_can_be_turned_off(self):
+        self.main.FORWARD_STICKERS = False
+        _, listener = self.start()
+        listener.onInsert("message", sticker_message())
+        listener.onInsert("message", message(text="hi"))
+
+        self.assertTrue(wait_until(lambda: self.sent))
+        time.sleep(0.1)
+        self.assertEqual(self.sent, [(B, "Group Nick: hi")])
 
     def download_image(self, server_id):
         self.events.append(f"download {server_id}")
@@ -320,26 +501,30 @@ class PluginMainTest(unittest.TestCase):
         time.sleep(0.8)
         self.assertTrue(self.saved_file.exists())
 
-    def test_mention_gets_a_reply_in_the_same_group_and_is_still_forwarded(self):
+    def test_mention_gets_a_reply_in_both_groups_and_is_still_forwarded(self):
         self.main.MENTION_REPLY_NAMES = ["甲"]
         context, listener = self.start()
         listener.onInsert("message", message(text="@机器人 你是谁", lvbuffer=MENTION_SOURCE))
 
-        self.assertTrue(wait_until(lambda: len(self.sent) == 2))
+        self.assertTrue(wait_until(lambda: len(self.sent) == 3))
+        reply = "喵喵喵，我猜你是甲"
         self.assertEqual(
             sorted(self.sent),
-            sorted([(B, "Group Nick: @机器人 你是谁"), (A, "喵喵喵，我猜你是甲")]),
+            sorted([(A, reply), (B, "Group Nick: @机器人 你是谁"), (B, reply)]),
         )
-        self.assertIn("Mention replies: on (1 names)", context.log.lines)
-        self.assertIn(f"Sent a mention reply to {A} in one send (9 characters); 0 messages still queued",
-                      context.log.lines)
+        # In the other group, the forwarded mention arrives before the reply.
+        to_b = [text for destination, text in self.sent if destination == B]
+        self.assertEqual(to_b, ["Group Nick: @机器人 你是谁", reply])
+        self.assertIn("Mention replies: on (1 possible replies, 1 names)", context.log.lines)
 
     def test_reply_picks_from_the_configured_names(self):
         names = ["甲", "乙", "丙", "丁"]
         self.main.MENTION_REPLY_NAMES = names
         self.main.MENTION_REPLY_COOLDOWN_SECONDS = 0.001
-        # Each reply is its own send, so allow more than the default 5 sends a minute.
+        # Each reply is its own send (twice, one per group), so allow plenty of sends,
+        # and keep the combine wait short so the ~18 sends finish quickly.
         self.main.GLOBAL_MAX_MESSAGES_PER_MINUTE = 100
+        self.main.COMBINE_WAIT_SECONDS = 0.02
         _, listener = self.start()
         for number in range(6):
             listener.onInsert(
@@ -348,6 +533,7 @@ class PluginMainTest(unittest.TestCase):
 
         self.assertTrue(wait_until(lambda: sum(1 for d, _ in self.sent if d == A) == 6))
         replies = [text for destination, text in self.sent if destination == A]
+        self.assertTrue(wait_until(lambda: sum(1 for d, t in self.sent if d == B and t in replies) == 6))
         self.assertTrue(all(text.removeprefix("喵喵喵，我猜你是") in names for text in replies))
 
     def test_no_reply_without_names(self):
@@ -357,7 +543,30 @@ class PluginMainTest(unittest.TestCase):
         self.assertTrue(wait_until(lambda: self.sent))
         time.sleep(0.1)
         self.assertEqual(self.sent, [(B, "Group Nick: @机器人")])
-        self.assertIn("Mention replies: off (no MENTION_REPLY_NAMES in local_config.py)", context.log.lines)
+        self.assertIn("Mention replies: off (no possible replies)", context.log.lines)
+
+    def test_default_replies_include_one_meow_per_name_and_the_quotes(self):
+        self.main.MENTION_REPLY_MESSAGES = self.default_replies
+        self.main.MENTION_REPLY_NAMES = ["甲", "乙", "丙", "丁"]
+        context, listener = self.start()
+        self.assertIn("Mention replies: on (13 possible replies, 4 names)", context.log.lines)
+
+        listener.onInsert("message", message(text="@机器人", lvbuffer=MENTION_SOURCE))
+        self.assertTrue(wait_until(lambda: any(d == A for d, _ in self.sent)))
+        reply = next(text for destination, text in self.sent if destination == A)
+        possible = [m for m in self.default_replies if "{person}" not in m]
+        possible += [f"喵喵喵，我猜你是{name}" for name in "甲乙丙丁"]
+        self.assertIn(reply, possible)
+
+    def test_quotes_still_work_without_names(self):
+        self.main.MENTION_REPLY_MESSAGES = self.default_replies
+        context, listener = self.start()
+        self.assertIn("Mention replies: on (9 possible replies, 0 names)", context.log.lines)
+
+        listener.onInsert("message", message(text="@机器人", lvbuffer=MENTION_SOURCE))
+        self.assertTrue(wait_until(lambda: any(d == A for d, _ in self.sent)))
+        reply = next(text for destination, text in self.sent if destination == A)
+        self.assertNotIn("喵喵喵", reply)
 
     def test_mentioning_someone_else_gets_no_reply(self):
         self.main.MENTION_REPLY_NAMES = ["甲"]
@@ -383,6 +592,50 @@ class PluginMainTest(unittest.TestCase):
         local_config.GROUP_B = B
         main = self.reload_main_with_local_config(local_config)
         self.assertEqual(main.MENTION_REPLY_NAMES, [])
+
+    def test_blocked_user_is_not_forwarded(self):
+        self.main.BLOCKED_USERS = ["wxid_spammer"]
+        context, listener = self.start()
+        listener.onInsert("message", message(sender="wxid_spammer", text="spam"))
+        listener.onInsert("message", message(sender="wxid_ok", text="hello"))
+
+        self.assertTrue(wait_until(lambda: self.sent))
+        time.sleep(0.05)
+        self.assertEqual(self.sent, [(B, "wxid_ok: hello")])
+        self.assertIn(
+            "User blocklist: 1 listed; over 100 messages an hour blocks for 2h", context.log.lines
+        )
+
+    def test_auto_block_constants_are_applied(self):
+        self.main.AUTO_BLOCK_MESSAGES_PER_HOUR = 2
+        context, listener = self.start()
+        for number in range(4):
+            listener.onInsert("message", message(sender="wxid_busy", text=str(number)))
+
+        expected = f"Blocked wxid_busy for sending too many messages (last seen in {A}); dropped 2 waiting messages"
+        self.assertTrue(wait_until(lambda: expected in context.log.lines))
+        time.sleep(0.4)
+        self.assertEqual(self.sent, [])
+
+    def test_auto_block_can_be_turned_off(self):
+        self.main.AUTO_BLOCK_MESSAGES_PER_HOUR = None
+        context, _ = self.start()
+        self.assertIn("User blocklist: 0 listed; automatic blocking off", context.log.lines)
+
+    def test_blocked_users_come_from_local_config(self):
+        local_config = types.ModuleType(f"{NAMESPACE}.local_config")
+        local_config.GROUP_A = A
+        local_config.GROUP_B = B
+        local_config.BLOCKED_USERS = ["wxid_spammer"]
+        main = self.reload_main_with_local_config(local_config)
+        self.assertEqual(main.BLOCKED_USERS, ["wxid_spammer"])
+
+    def test_blocked_users_are_optional_in_local_config(self):
+        local_config = types.ModuleType(f"{NAMESPACE}.local_config")
+        local_config.GROUP_A = A
+        local_config.GROUP_B = B
+        main = self.reload_main_with_local_config(local_config)
+        self.assertEqual(main.BLOCKED_USERS, [])
 
     def test_group_announcement_is_not_forwarded(self):
         context, listener = self.start()
