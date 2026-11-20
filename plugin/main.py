@@ -12,6 +12,7 @@ from dev.ujhhgtg.wekit.features.api.core import (  # ty: ignore[unresolved-impor
     WeDatabaseApi,
     WeDatabaseListenerApi,
     WeMessageApi,
+    WeServiceApi,
 )
 from java import dynamic_proxy  # ty: ignore[unresolved-import]
 
@@ -170,14 +171,13 @@ MAX_STICKERS_PER_USER_PER_MINUTE = 5
 # The line that credits a sticker's sender. Available field: {name}.
 STICKER_CREDIT_FORMAT = "{name}: [表情] ↓"
 
-# To forward a sticker, the bot saves it from WeChat as a normal file in the phone's
-# Download/WeKit folder and uploads that file. WeChat may still be fetching the sticker
-# when its message arrives, so saving is retried for up to this many seconds.
-STICKER_DOWNLOAD_SECONDS = 20
-
-# A saved sticker file is reused while the same sticker keeps being sent, and deleted
-# this many seconds after its latest send, whatever that send's outcome.
-DELETE_STICKERS_AFTER_SECONDS = 600
+# A sticker is forwarded by its MD5, the way WeChat itself forwards stickers; no file
+# is saved. WeChat registers a new sticker in the background after its message
+# arrives, which has taken around 10 seconds, so the bot checks every
+# STICKER_RETRY_SECONDS for up to STICKER_WAIT_SECONDS. Messages behind the sticker
+# wait meanwhile, to keep their order.
+STICKER_WAIT_SECONDS = 60
+STICKER_RETRY_SECONDS = 3
 
 # -----------------------------------------------------------------------
 
@@ -289,122 +289,41 @@ def _delete_later(ctx, path: str, timers: list[threading.Timer]) -> None:
     timer.start()
 
 
-class _StickerFiles:
-    """Saved sticker files, kept and reused while the same sticker keeps being sent.
-
-    People often send the same sticker again, so a saved file is found by the sticker's
-    MD5 and sent again rather than saved anew. Each file is deleted
-    DELETE_STICKERS_AFTER_SECONDS after its latest send, and every file is deleted
-    when the plugin stops. A sticker with no MD5 gets a file of its own.
-    """
-
-    def __init__(self, ctx) -> None:
-        self._ctx = ctx
-        self._lock = threading.Lock()
-        # Key (the MD5, or the path when there's none) -> (path, deletion timer). The
-        # timer is None while the file is being sent.
-        self._files: dict[str, tuple[str, threading.Timer | None]] = {}
-
-    @staticmethod
-    def _key(forward: Forward, path: str) -> str:
-        return forward.sticker_md5 or path
-
-    def reuse(self, forward: Forward) -> str | None:
-        """Returns the saved file for this sticker, holding off its deletion until
-        `sent` is called, or None if there's no saved file."""
-        if not forward.sticker_md5:
-            return None
-        with self._lock:
-            entry = self._files.get(forward.sticker_md5)
-            if entry is None:
-                return None
-            path, timer = entry
-            if timer is not None:
-                timer.cancel()
-            if not os.path.exists(path):
-                del self._files[forward.sticker_md5]
-                return None
-            self._files[forward.sticker_md5] = (path, None)
-            return path
-
-    def add(self, forward: Forward, path: str) -> None:
-        """Records a newly saved file, so it's deleted even if it's never sent."""
-        with self._lock:
-            old = self._files.get(self._key(forward, path))
-            if old is not None and old[0] != path:
-                # Another file for the same sticker; this one replaces it.
-                if old[1] is not None:
-                    old[1].cancel()
-                self._remove_file(old[0])
-            self._files[self._key(forward, path)] = (path, None)
-
-    def sent(self, forward: Forward, path: str) -> None:
-        """(Re)starts the countdown to deleting the file, after a send."""
-        key = self._key(forward, path)
-        with self._lock:
-            entry = self._files.get(key)
-            if entry is not None and entry[1] is not None:
-                entry[1].cancel()
-            timer = threading.Timer(DELETE_STICKERS_AFTER_SECONDS, self._expire, (key, path))
-            timer.daemon = True
-            self._files[key] = (path, timer)
-            timer.start()
-
-    def _expire(self, key: str, path: str) -> None:
-        with self._lock:
-            entry = self._files.get(key)
-            # Only the latest countdown for this file deletes it. An older one that was
-            # cancelled too late, or a file that is being sent again, is left alone.
-            if entry is None or entry[0] != path or entry[1] is not threading.current_thread():
-                return
-            del self._files[key]
-            self._remove_file(path)
-
-    def close(self) -> None:
-        with self._lock:
-            for path, timer in self._files.values():
-                if timer is not None:
-                    timer.cancel()
-                self._remove_file(path)
-            self._files.clear()
-
-    def _remove_file(self, path: str) -> None:
-        try:
-            os.remove(path)
-            self._ctx.log.info(f"Deleted forwarded sticker file {os.path.basename(path)}")
-        except FileNotFoundError:
-            pass
-        except OSError:
-            self._ctx.log.exception(f"Could not delete forwarded sticker file {path}")
-
-
-def _download_media(
-    ctx, forward: Forward, stop: threading.Event, stickers: _StickerFiles
-) -> str | None:
+def _download_media(ctx, forward: Forward, stop: threading.Event) -> str | None:
+    """Prepares an image or sticker, returning what's needed to send it, or None."""
     if forward.is_sticker:
-        return _download_sticker(ctx, forward, stop, stickers)
+        return _wait_for_sticker(ctx, forward, stop)
     return _download_image(ctx, forward)
 
 
-def _download_sticker(
-    ctx, forward: Forward, stop: threading.Event, stickers: _StickerFiles
-) -> str | None:
+def _is_registered(md5: str) -> bool:
+    try:
+        return WeServiceApi.INSTANCE.getEmojiInfoByMd5(md5) is not None
+    except Exception:  # noqa: BLE001 - treated as not registered yet
+        return False
+
+
+def _wait_for_sticker(ctx, forward: Forward, stop: threading.Event) -> str | None:
+    """Waits for WeChat to register the sticker, returning its MD5, or None."""
     server_id = forward.media_server_id
-    path = stickers.reuse(forward)
-    if path is not None:
-        ctx.log.info(f"Reusing the saved file for sticker {server_id}")
-        return path
-    # cacheAndSaveSticker looks up the sticker by its message's server ID, decodes
-    # WeChat's local copy into a normal image file, and saves that to Download/WeKit.
-    # It returns None while WeChat hasn't fetched the sticker yet, so keep trying.
-    deadline = time.monotonic() + STICKER_DOWNLOAD_SECONDS
+    md5 = forward.sticker_md5
+    started = time.monotonic()
+    tries = 0
     while True:
-        path = WeMessageApi.INSTANCE.cacheAndSaveSticker(server_id)
-        if path:
-            stickers.add(forward, str(path))
-            return str(path)
-        if time.monotonic() >= deadline or stop.wait(2):
-            ctx.log.error(f"Could not save sticker {server_id}; skipping it")
+        tries += 1
+        waited = time.monotonic() - started
+        if _is_registered(md5):
+            if tries > 1:
+                ctx.log.info(f"WeChat registered sticker {server_id} after {waited:.0f}s")
+            return md5
+        if tries == 1:
+            ctx.log.info(
+                f"Waiting up to {STICKER_WAIT_SECONDS}s for WeChat to register sticker {server_id}"
+            )
+        if waited >= STICKER_WAIT_SECONDS or stop.wait(STICKER_RETRY_SECONDS):
+            ctx.log.error(
+                f"WeChat didn't register sticker {server_id} within {waited:.0f}s; skipping it"
+            )
             return None
 
 
@@ -424,37 +343,27 @@ def _deliver_media(
     ctx,
     destination: str,
     forward: Forward,
-    path: str,
+    prepared: str,
     stop: threading.Event,
     timers: list[threading.Timer],
-    stickers: _StickerFiles,
 ) -> None:
     if forward.is_sticker:
-        _deliver_sticker(ctx, destination, forward, path, stop, stickers)
+        _deliver_sticker(ctx, destination, forward, prepared, stop)
     else:
-        _deliver_image(ctx, destination, forward, path, stop, timers)
+        _deliver_image(ctx, destination, forward, prepared, stop, timers)
 
 
 def _deliver_sticker(
-    ctx,
-    destination: str,
-    forward: Forward,
-    path: str,
-    stop: threading.Event,
-    stickers: _StickerFiles,
+    ctx, destination: str, forward: Forward, md5: str, stop: threading.Event
 ) -> None:
     server_id = forward.media_server_id
-    try:
-        outcome = _send_and_check(
-            ctx,
-            destination,
-            STICKER_MESSAGE_TYPE,
-            lambda: WeMessageApi.INSTANCE.sendSticker(destination, path),
-            stop,
-        )
-    finally:
-        # Counted from the latest send whatever happened, so files never pile up.
-        stickers.sent(forward, path)
+    outcome = _send_and_check(
+        ctx,
+        destination,
+        STICKER_MESSAGE_TYPE,
+        lambda: WeMessageApi.INSTANCE.sendEmojiByMd5(destination, md5),
+        stop,
+    )
     ctx.log.info(f"Sticker {server_id} to {destination}: {outcome}")
     if outcome not in ("sent", "unchecked") and not outcome.startswith("pending"):
         ctx.log.error(f"Could not forward sticker {server_id} to {destination}")
@@ -560,12 +469,9 @@ def setup(ctx) -> None:
     ctx.log.info(f"User blocklist: {user_blocker.listed_count} listed; {auto_block}")
 
     stop = threading.Event()
-    # Image deletions still waiting when the plugin stops are cancelled, keeping those
-    # files. Saved sticker files are all deleted.
+    # Deletions still waiting when the plugin stops are cancelled, keeping those files.
     deletion_timers: list[threading.Timer] = []
     ctx.defer(lambda: [timer.cancel() for timer in deletion_timers])
-    stickers = _StickerFiles(ctx)
-    ctx.defer(stickers.close)
     outbox = Outbox(MAX_QUEUED_MESSAGES)
     global_limiter = RateLimiter(GLOBAL_MAX_MESSAGES_PER_MINUTE)
     intake = Intake(
@@ -611,6 +517,7 @@ def setup(ctx) -> None:
                         server_id=values.getAsLong("msgSvrId"),
                         create_time_ms=values.getAsLong("createTime"),
                         msg_source=_message_source(values),
+                        img_path=values.getAsString("imgPath"),
                     )
                 )
             except Exception:
@@ -623,9 +530,9 @@ def setup(ctx) -> None:
             global_limiter,
             _format_line,
             lambda destination, text: _deliver(ctx, destination, text),
-            lambda forward: _download_media(ctx, forward, stop, stickers),
+            lambda forward: _download_media(ctx, forward, stop),
             lambda destination, forward, path: _deliver_media(
-                ctx, destination, forward, path, stop, deletion_timers, stickers
+                ctx, destination, forward, path, stop, deletion_timers
             ),
             stop,
             COMBINE_WAIT_SECONDS,

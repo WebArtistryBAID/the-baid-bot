@@ -119,6 +119,8 @@ class MessageRow:
     # The message's hidden metadata (WeChat's `lvbuffer` column), which lists who it
     # mentions. None when WeChat didn't provide it.
     msg_source: bytes | None = None
+    # WeChat's `imgPath` column. For a sticker, this is its MD5.
+    img_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -179,6 +181,47 @@ def parse_group_content(content: str | None) -> tuple[str, str] | None:
     if not separator or not sender or not text:
         return None
     return sender, text
+
+
+_FROM_USERNAME = re.compile(r'fromusername\s*=\s*"([^"]+)"')
+_COLON_SENDER = re.compile(r"^([^:\s<>]+):\d")
+_MD5 = re.compile(r"^[0-9a-fA-F]{32}$")
+
+
+def parse_sticker_content(content: str | None) -> tuple[str, str] | None:
+    """Finds the sender of a received group sticker, returning (sender, rest).
+
+    WeChat doesn't always store stickers as "wxid:\nXML" like other messages. It may
+    store just the XML, with the sender in <emoji fromusername="…">, or a
+    colon-separated form starting "wxid:0:". `rest` is whatever XML there is, or "".
+    """
+    parsed = parse_group_content(content)
+    if parsed is not None:
+        return parsed
+    content = (content or "").strip()
+    xml_start = content.find("<")
+    xml = content[xml_start:] if xml_start >= 0 else ""
+    found = _FROM_USERNAME.search(xml)
+    if found is not None and not found.group(1).endswith("@chatroom"):
+        return found.group(1).strip(), xml
+    found = _COLON_SENDER.match(content)
+    if found is not None:
+        return found.group(1), xml
+    return None
+
+
+def content_shape(content: str | None, limit: int = 80) -> str:
+    """The layout of some content with every letter and digit hidden, for logs.
+
+    Shows where the separators and markup are without revealing what was said.
+    """
+    shape = re.sub(r"[^\W_]+", "x", (content or "")[:limit])
+    return shape.replace("\n", "\\n")
+
+
+def md5_from_img_path(img_path: str | None) -> str | None:
+    value = (img_path or "").strip()
+    return value.lower() if _MD5.match(value) else None
 
 
 # A sticker that can't be forwarded: one from the sticker store, or a dice or
@@ -547,11 +590,19 @@ class Intake:
         if destination is None or row.is_send == 1:
             return IGNORED
 
-        parsed = parse_group_content(row.content)
+        group = row.talker
+        if row.msg_type == STICKER_MESSAGE_TYPE:
+            parsed = parse_sticker_content(row.content)
+        else:
+            parsed = parse_group_content(row.content)
         if parsed is None:
+            # The content may be private, so only its layout is logged.
+            self._log.info(
+                f"Skipped a type-{row.msg_type} message in {group}: could not read its sender "
+                f"(content looks like {content_shape(row.content)!r})"
+            )
             return IGNORED
         sender, text = parsed
-        group = row.talker
 
         # Checked before the message type, so stickers and other messages that are never
         # forwarded still count toward the automatic block.
@@ -559,6 +610,10 @@ class Intake:
             return BLOCKED_USER
 
         if row.msg_type not in accepted_types:
+            self._log.info(
+                f"Skipped a type-{row.msg_type} message from {sender} in {group}: "
+                "that type isn't forwarded"
+            )
             return IGNORED
         # A quote is forwarded as plain text: just the reply, without the quoted message.
         # Other app messages (links, files, mini programs) are not forwarded.
@@ -568,6 +623,10 @@ class Intake:
                 if row.msg_type == QUOTE_MESSAGE_TYPE:
                     self._log.warning(
                         f"Skipped a quote from {sender} in {group}: could not read its text"
+                    )
+                else:
+                    self._log.info(
+                        f"Skipped an app message from {sender} in {group}: not a quote"
                     )
                 return IGNORED
             text = quote_text
@@ -585,16 +644,20 @@ class Intake:
 
         md5 = None
         if is_sticker:
-            md5 = sticker_md5(text)
+            md5 = sticker_md5(text) or md5_from_img_path(row.img_path)
             unsupported = sticker_kind(text)
             if unsupported is not None:
                 self._log.info(f"Skipped a {unsupported} sticker {source}: can't be forwarded")
                 return IGNORED
         if is_media:
-            # The server ID is how the sender later asks WeKit for the file.
+            # An image is fetched by its server ID. A sticker is sent by its MD5, and its
+            # server ID is still needed to tell repeats apart.
             if not row.server_id:
                 self._log.warning(f"Skipped {a_kind} {source}: it has no server ID")
                 return BAD_IMAGE if is_image else BAD_STICKER
+            if is_sticker and md5 is None:
+                self._log.warning(f"Skipped a sticker {source}: could not read its MD5")
+                return BAD_STICKER
             text = ""
         # Checked before the rate limits, so a blocked message doesn't use up any quota.
         elif self._blocked_words.matches(text):

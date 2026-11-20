@@ -170,9 +170,15 @@ class PluginMainTest(unittest.TestCase):
                 sendText=self.send_text,
                 sendImage=self.send_image_file,
                 downloadImage=self.download_image,
-                sendSticker=self.send_sticker_file,
-                cacheAndSaveSticker=self.save_sticker,
+                sendEmojiByMd5=self.send_sticker_by_md5,
             )
+        )
+        # MD5s of the stickers WeChat has registered.
+        self.registered_stickers = {"abc123"}
+        # How many more lookups of each MD5 find nothing before it counts as registered.
+        self.registration_delays = {}
+        core_api.WeServiceApi = SimpleNamespace(
+            INSTANCE=SimpleNamespace(getEmojiInfoByMd5=self.emoji_info)
         )
         java = types.ModuleType("java")
         java.dynamic_proxy = lambda interface: interface
@@ -204,8 +210,8 @@ class PluginMainTest(unittest.TestCase):
         self.main.COMBINE_WAIT_SECONDS = 0.3
         self.main.IMAGE_SEND_CHECK_SECONDS = 1
         self.main.DELETE_IMAGES_AFTER_SECONDS = 0.05
-        self.main.DELETE_STICKERS_AFTER_SECONDS = 0.05
-        self.main.STICKER_DOWNLOAD_SECONDS = 0
+        self.main.STICKER_WAIT_SECONDS = 0
+        self.main.STICKER_RETRY_SECONDS = 0.01
 
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -220,10 +226,6 @@ class PluginMainTest(unittest.TestCase):
         self.upload_status = 2
         self.upload_accepted = True
         self.uploads = []
-        self.sticker_file = Path(directory.name) / "Download" / "WeKit" / "sticker_1.gif"
-        self.sticker_file.write_bytes(b"sticker bytes")
-        # What each cacheAndSaveSticker call returns, in turn; the last one repeats.
-        self.sticker_results = [str(self.sticker_file)]
 
     def send_text(self, destination, text):
         self.events.append(f"text {text}")
@@ -238,25 +240,26 @@ class PluginMainTest(unittest.TestCase):
             self.database.add_sent_image(destination, self.upload_status)
         return self.upload_accepted
 
-    def send_sticker_file(self, destination, path):
-        self.events.append(f"sticker {path}")
-        self.uploads.append((destination, path))
-        self.sent.append((destination, f"<sticker {Path(path).name}>"))
+    def emoji_info(self, md5):
+        self.events.append(f"look up {md5}")
+        if self.registration_delays.get(md5, 0) > 0:
+            self.registration_delays[md5] -= 1
+            return None
+        return object() if md5 in self.registered_stickers else None
+
+    def send_sticker_by_md5(self, destination, md5):
+        self.events.append(f"sticker {md5}")
+        self.uploads.append((destination, md5))
+        self.sent.append((destination, f"<sticker {md5}>"))
         if self.upload_accepted and self.upload_status is not None:
             self.database.add_sent_image(destination, self.upload_status, message_type=47)
         return self.upload_accepted
-
-    def save_sticker(self, server_id):
-        self.events.append(f"save sticker {server_id}")
-        if len(self.sticker_results) > 1:
-            return self.sticker_results.pop(0)
-        return self.sticker_results[0]
 
     def sticker_log(self, context, outcome, server_id=600, destination=B):
         line = f"Sticker {server_id} to {destination}: {outcome}"
         return wait_until(lambda: line in context.log.lines)
 
-    def test_sticker_is_saved_then_credited_then_sent_in_order(self):
+    def test_sticker_is_credited_then_sent_by_md5_in_order(self):
         context, listener = self.start()
         listener.onInsert("message", message(text="before"))
         listener.onInsert("message", sticker_message(server_id=600))
@@ -267,114 +270,53 @@ class PluginMainTest(unittest.TestCase):
         self.assertEqual(
             self.events,
             [
-                "save sticker 600",
+                "look up abc123",
                 "text Group Nick: before\nGroup Nick: [表情] ↓",
-                f"sticker {self.sticker_file}",
+                "sticker abc123",
                 "text Group Nick: after",
             ],
         )
+        self.assertEqual(self.uploads, [(B, "abc123")])
 
-    def test_sticker_file_is_deleted_after_sending(self):
+    def test_sticker_waits_until_wechat_registers_it(self):
+        self.main.STICKER_WAIT_SECONDS = 10
+        self.registration_delays["abc123"] = 2
         context, listener = self.start()
         listener.onInsert("message", sticker_message())
 
         self.assertTrue(self.sticker_log(context, "sent"))
-        self.assertTrue(wait_until(lambda: not self.sticker_file.exists()))
-        self.assertIn("Deleted forwarded sticker file sticker_1.gif", context.log.lines)
+        self.assertEqual(self.events.count("look up abc123"), 3)
+        self.assertIn("Waiting up to 10s for WeChat to register sticker 600", context.log.lines)
+        self.assertIn("WeChat registered sticker 600 after 0s", context.log.lines)
 
-    def test_same_sticker_reuses_its_saved_file(self):
-        self.main.DELETE_STICKERS_AFTER_SECONDS = 60
+    def test_unregistered_sticker_is_skipped_with_its_credit(self):
+        self.registered_stickers = set()
         context, listener = self.start()
-        listener.onInsert("message", sticker_message(server_id=600))
-        self.assertTrue(self.sticker_log(context, "sent", server_id=600))
-        listener.onInsert("message", sticker_message(talker=B, server_id=601))
+        listener.onInsert("message", message(text="look"))
+        listener.onInsert("message", sticker_message())
 
-        self.assertTrue(self.sticker_log(context, "sent", server_id=601, destination=A))
-        self.assertEqual(self.events.count("save sticker 600"), 1)
-        self.assertNotIn("save sticker 601", self.events)
-        self.assertEqual(self.uploads, [(B, str(self.sticker_file)), (A, str(self.sticker_file))])
-        self.assertIn("Reusing the saved file for sticker 601", context.log.lines)
+        expected = "WeChat didn't register sticker 600 within 0s; skipping it"
+        self.assertTrue(wait_until(lambda: expected in context.log.lines))
+        self.assertTrue(wait_until(lambda: self.sent))
+        time.sleep(0.1)
+        self.assertEqual(self.sent, [(B, "Group Nick: look")])
+        self.assertEqual(self.uploads, [])
 
-    def test_sticker_file_is_deleted_only_after_its_latest_send(self):
-        self.main.DELETE_STICKERS_AFTER_SECONDS = 1.5
-        context, listener = self.start()
-        listener.onInsert("message", sticker_message(server_id=600))
-        self.assertTrue(self.sticker_log(context, "sent", server_id=600))
-        first_sent = time.monotonic()
-        time.sleep(0.4)
-        listener.onInsert("message", sticker_message(server_id=601))
-        self.assertTrue(self.sticker_log(context, "sent", server_id=601))
-        self.assertNotIn("save sticker 601", self.events)
-
-        # Past the first send's countdown, but not the second's.
-        time.sleep(max(0.0, first_sent + 1.7 - time.monotonic()))
-        self.assertTrue(self.sticker_file.exists())
-        self.assertTrue(wait_until(lambda: not self.sticker_file.exists()))
-
-    def test_different_stickers_get_their_own_files(self):
-        other_file = self.sticker_file.with_name("sticker_2.gif")
-        other_file.write_bytes(b"other sticker")
-        self.sticker_results = [str(self.sticker_file), str(other_file)]
-        context, listener = self.start()
-        listener.onInsert("message", sticker_message(server_id=600, md5="aaa"))
-        self.assertTrue(self.sticker_log(context, "sent", server_id=600))
-        listener.onInsert("message", sticker_message(server_id=601, md5="bbb"))
-
-        self.assertTrue(self.sticker_log(context, "sent", server_id=601))
-        self.assertEqual(self.uploads, [(B, str(self.sticker_file)), (B, str(other_file))])
-
-    def test_deleted_sticker_file_is_saved_again(self):
-        self.main.DELETE_STICKERS_AFTER_SECONDS = 0.05
-        context, listener = self.start()
-        listener.onInsert("message", sticker_message(server_id=600))
-        self.assertTrue(self.sticker_log(context, "sent", server_id=600))
-        self.assertTrue(wait_until(lambda: not self.sticker_file.exists()))
-        self.sticker_file.write_bytes(b"sticker bytes")
-        listener.onInsert("message", sticker_message(server_id=601))
-
-        self.assertTrue(self.sticker_log(context, "sent", server_id=601))
-        self.assertIn("save sticker 601", self.events)
-
-    def test_sticker_file_is_deleted_even_when_the_send_fails(self):
+    def test_failed_sticker_send_is_logged(self):
         self.upload_status = 5
         context, listener = self.start()
         listener.onInsert("message", sticker_message())
 
         self.assertTrue(self.sticker_log(context, "failed"))
-        self.assertTrue(wait_until(lambda: not self.sticker_file.exists()))
-        self.assertIn(f"Could not forward sticker 600 to {B}", context.log.lines)
-
-    def test_stopping_deletes_waiting_sticker_files(self):
-        self.main.DELETE_STICKERS_AFTER_SECONDS = 60
-        context, listener = self.start()
-        listener.onInsert("message", sticker_message())
-
-        self.assertTrue(self.sticker_log(context, "sent"))
-        self.assertTrue(self.sticker_file.exists())
-        context.close()
-        context.cleanup.clear()
-        self.assertFalse(self.sticker_file.exists())
-
-    def test_sticker_save_is_retried_until_wechat_has_it(self):
-        self.main.STICKER_DOWNLOAD_SECONDS = 10
-        self.sticker_results = [None, str(self.sticker_file)]
-        context, listener = self.start()
-        listener.onInsert("message", sticker_message())
-
-        self.assertTrue(self.sticker_log(context, "sent"))
-        self.assertEqual(self.events.count("save sticker 600"), 2)
-
-    def test_sticker_that_cannot_be_saved_is_skipped_with_its_credit(self):
-        self.sticker_results = [None]
-        context, listener = self.start()
-        listener.onInsert("message", message(text="look"))
-        listener.onInsert("message", sticker_message())
-
-        expected = "Could not save sticker 600; skipping it"
+        expected = f"Could not forward sticker 600 to {B}"
         self.assertTrue(wait_until(lambda: expected in context.log.lines))
-        self.assertTrue(wait_until(lambda: self.sent))
-        time.sleep(0.1)
-        self.assertEqual(self.sent, [(B, "Group Nick: look")])
+
+    def test_sticker_wekit_refuses_is_logged(self):
+        self.upload_accepted = False
+        context, listener = self.start()
+        listener.onInsert("message", sticker_message())
+
+        self.assertTrue(self.sticker_log(context, "rejected by WeKit"))
 
     def test_store_stickers_are_not_forwarded(self):
         _, listener = self.start()
@@ -386,7 +328,7 @@ class PluginMainTest(unittest.TestCase):
         self.assertTrue(wait_until(lambda: self.sent))
         time.sleep(0.1)
         self.assertEqual(self.sent, [(B, "Group Nick: hi")])
-        self.assertNotIn("save sticker 600", self.events)
+        self.assertEqual(self.uploads, [])
 
     def test_stickers_can_be_turned_off(self):
         self.main.FORWARD_STICKERS = False

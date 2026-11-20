@@ -33,13 +33,16 @@ from relay_core import (
     RateLimiter,
     UserBlocker,
     combine,
+    content_shape,
     expand_replies,
     is_announcement,
     load_blocked_words,
+    md5_from_img_path,
     mentioned_users,
     normalise_for_matching,
     parse_group_content,
     parse_quote_text,
+    parse_sticker_content,
     run_sender,
     sticker_kind,
     sticker_md5,
@@ -308,6 +311,24 @@ class IntakeLogTest(unittest.TestCase):
             [
                 ("info", f"Queued a message from wxid_x in {A} for {B} (1 waiting)"),
                 ("info", f"Queued a message from wxid_y in {A} for {B} (2 waiting)"),
+            ],
+        )
+
+    def test_messages_of_other_types_say_why_they_were_skipped(self):
+        intake, log, _ = self.accept(None)
+        intake.accept(row(msg_type=43, content="wxid_x:\n<msg><videomsg/></msg>"))
+        intake.accept(row(msg_type=47, content="no sender here"))
+        self.assertEqual(
+            log.lines,
+            [
+                ("info", f"Skipped a type-43 message from wxid_x in {A}: that type isn't forwarded"),
+                (
+                    "info",
+                    (
+                        f"Skipped a type-47 message in {A}: could not read its sender "
+                        "(content looks like 'x x x')"
+                    ),
+                ),
             ],
         )
 
@@ -666,7 +687,60 @@ class StickerKindTest(unittest.TestCase):
         self.assertIsNone(sticker_md5("<msg><emoji"))
 
 
+class StickerContentTest(unittest.TestCase):
+    def test_usual_layout(self):
+        self.assertEqual(parse_sticker_content("wxid_a:\n<msg/>"), ("wxid_a", "<msg/>"))
+
+    def test_xml_only_takes_the_sender_from_the_emoji(self):
+        xml = '<msg><emoji fromusername="wxid_a" tousername="1@chatroom" md5="m" /></msg>'
+        self.assertEqual(parse_sticker_content(xml), ("wxid_a", xml))
+
+    def test_xml_after_a_prefix_without_a_newline(self):
+        xml = '<msg><emoji fromusername="wxid_a" md5="m" /></msg>'
+        self.assertEqual(parse_sticker_content("1@chatroom:" + xml), ("wxid_a", xml))
+
+    def test_colon_separated_layout(self):
+        self.assertEqual(parse_sticker_content("wxid_a:0:0:abc::0"), ("wxid_a", ""))
+
+    def test_group_is_never_taken_as_the_sender(self):
+        self.assertIsNone(parse_sticker_content('<msg><emoji fromusername="1@chatroom" /></msg>'))
+
+    def test_unreadable(self):
+        self.assertIsNone(parse_sticker_content("no sender"))
+        self.assertIsNone(parse_sticker_content(None))
+
+    def test_shape_hides_letters_and_digits(self):
+        self.assertEqual(
+            content_shape('wxid_ab12:0:\n<msg md5="9f"/>'), 'x_x:x:\\n<x x="x"/>'
+        )
+        self.assertEqual(content_shape("你好 world"), "x x")
+
+    def test_md5_from_img_path(self):
+        md5 = "0123456789ABCDEF0123456789abcdef"
+        self.assertEqual(md5_from_img_path(md5), md5.lower())
+        self.assertIsNone(md5_from_img_path("THUMBNAIL_DIRPATH://th_1"))
+        self.assertIsNone(md5_from_img_path(None))
+
+
 class StickerIntakeTest(unittest.TestCase):
+    def test_xml_only_sticker_is_queued_with_its_sender(self):
+        intake, outbox, _ = make_intake(sticker_limit=3)
+        xml = '<msg><emoji fromusername="wxid_s" md5="ABC" type="2" /></msg>'
+        message = row(msg_type=STICKER_MESSAGE_TYPE, server_id=600, content=xml)
+        self.assertEqual(intake.accept(message), QUEUED)
+        forward = outbox.waiting_for(B)[0]
+        self.assertEqual((forward.sender, forward.sticker_md5), ("wxid_s", "abc"))
+
+    def test_colon_layout_sticker_takes_its_md5_from_img_path(self):
+        intake, outbox, _ = make_intake(sticker_limit=3)
+        md5 = "0123456789abcdef0123456789abcdef"
+        message = row(
+            msg_type=STICKER_MESSAGE_TYPE, server_id=600, content=f"wxid_s:0:0:{md5}::0", img_path=md5
+        )
+        self.assertEqual(intake.accept(message), QUEUED)
+        forward = outbox.waiting_for(B)[0]
+        self.assertEqual((forward.sender, forward.sticker_md5), ("wxid_s", md5))
+
     def test_stickers_are_ignored_unless_enabled(self):
         intake, outbox, _ = make_intake(image_limit=3)
         self.assertEqual(intake.accept(sticker_row()), IGNORED)
@@ -684,6 +758,12 @@ class StickerIntakeTest(unittest.TestCase):
     def test_sticker_without_a_server_id_is_dropped(self):
         intake, outbox, _ = make_intake(sticker_limit=3)
         self.assertEqual(intake.accept(sticker_row(server_id=None)), BAD_STICKER)
+        self.assertEqual(len(outbox), 0)
+
+    def test_sticker_without_an_md5_is_dropped(self):
+        intake, outbox, _ = make_intake(sticker_limit=3)
+        no_md5 = row(msg_type=STICKER_MESSAGE_TYPE, server_id=600, content="wxid_x:\n<msg><emoji /></msg>")
+        self.assertEqual(intake.accept(no_md5), BAD_STICKER)
         self.assertEqual(len(outbox), 0)
 
     def test_store_and_game_stickers_are_skipped(self):
